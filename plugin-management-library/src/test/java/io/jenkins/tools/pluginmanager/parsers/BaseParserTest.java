@@ -4,40 +4,51 @@ import io.jenkins.tools.pluginmanager.config.Config;
 import io.jenkins.tools.pluginmanager.config.Settings;
 import io.jenkins.tools.pluginmanager.impl.Plugin;
 import io.jenkins.tools.pluginmanager.impl.PluginManager;
-import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import org.apache.commons.io.IOUtils;
 import org.json.JSONObject;
-import org.junit.Before;
+import org.junit.jupiter.api.BeforeEach;
 
-public class BaseParserTest {
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+class BaseParserTest {
 
     protected PluginManager pm;
 
-    @Before
-    public void before() throws IOException {
+    @BeforeEach
+    void before() throws Exception {
         pm = new PluginManager(Config.builder().withJenkinsWar(Settings.DEFAULT_WAR).build());
         JSONObject pluginInfoJson = loadPluginVersionsFromClassPath();
-        pm.setPluginInfoJson(pluginInfoJson);
+        pm.setLatestUcPlugins(pluginInfoJson.getJSONObject("plugins"));
+        JSONObject experimentalPlugins = loadExperimentalPluginVersionsFromClassPath();
+        pm.setExperimentalPlugins(experimentalPlugins.getJSONObject("plugins"));
     }
 
     @SuppressWarnings("SameParameterValue")
-    public Plugin plugin(String name, String version) {
+    protected Plugin plugin(String name, String version) {
         return new Plugin(name, version, null, null);
     }
 
-    public Plugin plugin(String name, String version, String groupId) {
+    protected Plugin plugin(String name, String version, String groupId) {
         return new Plugin(name, version, null, groupId);
     }
 
-    public Plugin pluginWithUrl(String name, String url) {
+    protected Plugin pluginWithUrl(String name, String url) {
         return new Plugin(name, null, url, null);
     }
 
-    protected JSONObject loadPluginVersionsFromClassPath() throws IOException {
-        try (InputStream stream = getClass().getResourceAsStream("../impl/available-updates/simple-plugin-versions.json")) {
-            return new JSONObject(IOUtils.toString(stream, StandardCharsets.UTF_8));
+    protected JSONObject loadPluginVersionsFromClassPath() throws Exception {
+        try (InputStream stream = getClass().getResourceAsStream("../impl/available-updates/update-center.actual.json")) {
+          assertNotNull(stream);
+          return new JSONObject(IOUtils.toString(stream, StandardCharsets.UTF_8));
+        }
+    }
+
+    private JSONObject loadExperimentalPluginVersionsFromClassPath() throws Exception {
+        try (InputStream stream = getClass().getResourceAsStream("../impl/available-updates/update-center.experimental.json")) {
+          assertNotNull(stream);
+          return new JSONObject(IOUtils.toString(stream, StandardCharsets.UTF_8));
         }
     }
 }

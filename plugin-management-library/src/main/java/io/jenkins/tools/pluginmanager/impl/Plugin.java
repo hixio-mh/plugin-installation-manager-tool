@@ -9,8 +9,9 @@ import java.util.Objects;
 import org.apache.commons.lang3.StringUtils;
 
 public class Plugin {
+    public static final String LATEST = "latest";
+    public static final String EXPERIMENTAL = "experimental";
     private String name;
-    private String originalName;
     private VersionNumber version;
     private String groupId;
     private String url;
@@ -22,13 +23,14 @@ public class Plugin {
     private List<SecurityWarning> securityWarnings;
     private boolean latest;
     private boolean experimental;
+    private boolean optional;
+    private String checksum;
     private VersionNumber jenkinsVersion;
 
     public Plugin(String name, String version, String url, String groupId) {
-        this.originalName = name;
         this.name = name;
         if (StringUtils.isEmpty(version)) {
-            version = "latest";
+            version = Plugin.LATEST;
         }
         this.version = new VersionNumber(version);
         this.url = url;
@@ -36,10 +38,10 @@ public class Plugin {
         this.parent = this;
         this.groupId = groupId;
         this.securityWarnings = new ArrayList<>();
-        if (version.equals("latest")) {
+        if (version.equals(Plugin.LATEST)) {
             latest = true;
         }
-        if (version.equals("experimental")) {
+        if (version.equals(Plugin.EXPERIMENTAL)) {
             experimental = true;
         }
     }
@@ -72,6 +74,14 @@ public class Plugin {
         this.latest = latest;
     }
 
+    public String getChecksum() {
+        return checksum;
+    }
+
+    public void setChecksum(String checksum) {
+        this.checksum = checksum;
+    }
+
     public String getName() {
         return name;
     }
@@ -88,12 +98,10 @@ public class Plugin {
         return name + ".jpi";
     }
 
+    public String getBackupFileName() { return name + ".bak"; }
+
     public File getFile() {
         return file;
-    }
-
-    public String getOriginalName() {
-        return originalName;
     }
 
     public String getGroupId() {
@@ -129,6 +137,15 @@ public class Plugin {
 
     public Plugin getParent() {
         return parent;
+    }
+
+    public Plugin setOptional(boolean optional) {
+        this.optional = optional;
+        return this;
+    }
+
+    public boolean getOptional() {
+        return this.optional;
     }
 
     public VersionNumber getJenkinsVersion() {
@@ -171,7 +188,8 @@ public class Plugin {
         return Objects.equals(name, plugin.name) &&
                 Objects.equals(version, plugin.version) &&
                 Objects.equals(groupId, plugin.groupId) &&
-                Objects.equals(url, plugin.url);
+                Objects.equals(url, plugin.url) &&
+                Objects.equals(optional, plugin.optional);
     }
 
     @Override

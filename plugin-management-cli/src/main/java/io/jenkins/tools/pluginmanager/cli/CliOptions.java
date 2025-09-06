@@ -1,8 +1,12 @@
 package io.jenkins.tools.pluginmanager.cli;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import hudson.util.VersionNumber;
 import io.jenkins.tools.pluginmanager.config.Config;
+import io.jenkins.tools.pluginmanager.config.Credentials;
+import io.jenkins.tools.pluginmanager.config.HashFunction;
 import io.jenkins.tools.pluginmanager.config.OutputFormat;
 import io.jenkins.tools.pluginmanager.config.PluginInputException;
 import io.jenkins.tools.pluginmanager.config.Settings;
@@ -37,11 +41,23 @@ class CliOptions {
             handler = FileOptionHandler.class)
     private File pluginDir;
 
+    @Option(name = "--clean-download-directory",
+            usage = "If set, cleans the plugin download directory before plugin installation. " +
+                    "Otherwise the tool performs plugin download and reports compatibility issues, if any.")
+    private boolean cleanPluginDir;
+
     @Option(name = "--plugins", aliases = {"-p"}, usage = "List of plugins to install, separated by a space",
             handler = StringArrayOptionHandler.class)
     private String[] plugins = new String[0];
 
+    @Option(name = "--jenkins-version", usage = "Jenkins version to be used. " +
+            "If undefined, Plugin Manager will use alternative ways to retrieve the version, e.g. from WAR",
+            handler = VersionNumberHandler.class)
+    @CheckForNull
+    private VersionNumber jenkinsVersion;
+
     @Option(name = "--war", aliases = {"-w"}, usage = "Path to Jenkins war file")
+    @CheckForNull
     private String jenkinsWarFile;
 
     @Option(name = "--list", aliases = {"-l"}, usage = "Lists all plugins currently installed and if given a list of " +
@@ -58,12 +74,21 @@ class CliOptions {
     private boolean showAvailableUpdates;
 
     @Option(name = "--output", usage = "Output format for available updates",   aliases = "-o")
-    private OutputFormat outputFormat;
+    private OutputFormat outputFormat = OutputFormat.STDOUT;
 
+    /**
+     * Deprecated, see: https://github.com/jenkinsci/plugin-installation-manager-tool/issues/258
+     */
     @Option(name = "--view-security-warnings",
             usage = "Show if any security warnings exist for the requested plugins",
             handler = BooleanOptionHandler.class)
+    @Deprecated
     private boolean showWarnings;
+
+    @Option(name = "--hide-security-warnings",
+            usage = "Hide if any security warnings exist for the requested plugins",
+            handler = BooleanOptionHandler.class)
+    private boolean hideWarnings;
 
     @Option(name = "--view-all-security-warnings",
             usage = "Set to true to show all plugins that have security warnings",
@@ -100,12 +125,12 @@ class CliOptions {
     @Option(name = "--version", aliases = {"-v"}, usage = "View version and exit", handler = BooleanOptionHandler.class)
     private boolean showVersion;
 
-    @Option(name = "--no-download", usage = "Set true to avoid downloading plugins; can be used in combination with " +
+    @Option(name = "--no-download", usage = "Avoid downloading plugins; can be used in combination with " +
             "other options to see information about plugins and their dependencies",
             handler = BooleanOptionHandler.class)
     private boolean isNoDownload;
 
-    @Option(name = "--latest-specified", usage = "Set to true to download latest transitive dependencies of any " +
+    @Option(name = "--latest-specified", usage = "Download latest transitive dependencies of any " +
             "plugin that is requested to have the latest version. By default, plugin dependency versions will be " +
             "determined by the update center metadata or plugin MANIFEST.MF",
             handler = BooleanOptionHandler.class)
@@ -121,10 +146,14 @@ class CliOptions {
     @Option(name = "--help", aliases = {"-h"}, help = true)
     private boolean showHelp;
 
-    @Option(name = "--skip-failed-plugins", usage = "Set to true to skip installing plugins that have failed to download. " +
+    @Option(name = "--skip-failed-plugins", usage = "Skip installing plugins that have failed to download. " +
             "By default, if a single plugin is unavailable then all plugins fail to download and install.",
             handler = BooleanOptionHandler.class)
     private boolean skipFailedPlugins;
+
+    @Option(name = "--credentials", usage = "Comma-separated list of credentials in format '<host>[:port]:<username>:<password>'. The password must not contain space or ','",
+            handler = MultiCredentialsOptionHandler.class)
+    private List<Credentials> credentials;
 
     /**
      * Creates a configuration class with configurations specified from the CLI and/or environment variables.
@@ -135,12 +164,15 @@ class CliOptions {
         return Config.builder()
                 .withPlugins(getPlugins())
                 .withPluginDir(getPluginDir())
+                .withCleanPluginsDir(isCleanPluginDir())
                 .withJenkinsUc(getUpdateCenter())
                 .withJenkinsUcExperimental(getExperimentalUpdateCenter())
                 .withJenkinsIncrementalsRepoMirror(getIncrementalsMirror())
                 .withJenkinsPluginInfo(getPluginInfo())
+                .withJenkinsVersion(getJenkinsVersion())
                 .withJenkinsWar(getJenkinsWar())
                 .withShowWarnings(isShowWarnings())
+                .withHideWarnings(isHideWarnings())
                 .withShowAllWarnings(isShowAllWarnings())
                 .withShowPluginsToBeDownloaded(isShowPluginsToBeDownloaded())
                 .withShowAvailableUpdates(isShowAvailableUpdates())
@@ -150,9 +182,12 @@ class CliOptions {
                 .withUseLatestSpecified(isUseLatestSpecified())
                 .withUseLatestAll(isUseLatestAll())
                 .withSkipFailedPlugins(isSkipFailedPlugins())
+                .withCredentials(credentials)
+                .withHashFunction(getHashFunction())
                 .build();
     }
 
+    @NonNull
     public OutputFormat getOutputFormat() {
         return outputFormat;
     }
@@ -165,14 +200,10 @@ class CliOptions {
      */
     private File getPluginFile() {
         if (pluginFile == null) {
-            if (verbose) {
-                System.out.println("No .txt or .yaml file containing list of plugins to be downloaded entered.");
-            }
+            logVerbose("No .txt or .yaml file containing list of plugins to be downloaded entered.");
         } else {
             if (Files.exists(pluginFile.toPath())) {
-                if (verbose) {
-                    System.out.println("File containing list of plugins to be downloaded: " + pluginFile);
-                }
+                logVerbose("File containing list of plugins to be downloaded: " + pluginFile);
             } else {
                 throw new PluginInputException("File containing list of plugins does not exist " + pluginFile.toPath());
             }
@@ -186,22 +217,37 @@ class CliOptions {
     @SuppressFBWarnings(value = "PATH_TRAVERSAL_IN", justification = "we want the user to be able to specify a path")
     private File getPluginDir() {
         if (pluginDir != null) {
-            if (verbose) {
-                System.out.println("Plugin download location: " + pluginDir);
-            }
+            logVerbose("Plugin download location: " + pluginDir);
             return pluginDir;
         } else if (!StringUtils.isEmpty(System.getenv("PLUGIN_DIR"))) {
-            if (verbose) {
-                System.out.println("No directory to download plugins entered. " +
-                        "Will use location specified in PLUGIN_DIR environment variable: " + System.getenv("PLUGIN_DIR"));
-            }
+            logVerbose("No directory to download plugins entered. " +
+                    "Will use location specified in PLUGIN_DIR environment variable: " + System.getenv("PLUGIN_DIR"));
             return new File(System.getenv("PLUGIN_DIR"));
         }
-        if (verbose) {
-            System.out.println("No directory to download plugins entered. " +
-                    "Will use default of " + Settings.DEFAULT_PLUGIN_DIR_LOCATION);
-        }
+        logVerbose("No directory to download plugins entered. Will use default of " + Settings.DEFAULT_PLUGIN_DIR_LOCATION);
         return new File(Settings.DEFAULT_PLUGIN_DIR_LOCATION);
+    }
+
+    public boolean isCleanPluginDir() {
+        return cleanPluginDir;
+    }
+
+    @CheckForNull
+    private VersionNumber getJenkinsVersion() {
+        if (jenkinsVersion != null) {
+            return jenkinsVersion;
+        }
+
+        String fromEnv = System.getenv("JENKINS_VERSION");
+        if (StringUtils.isNotBlank(fromEnv)) {
+            try {
+                return new VersionNumber(fromEnv);
+            } catch (Exception ex) {
+                throw new VersionNotFoundException("Failed to parse the version from JENKINS_VERSION=" + fromEnv, ex);
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -209,14 +255,10 @@ class CliOptions {
      */
     private String getJenkinsWar() {
         if (jenkinsWarFile == null) {
-            if (verbose) {
-                System.out.println("No war entered. Will use default of " + Settings.DEFAULT_WAR);
-            }
+            logVerbose("No war entered. Will use default of " + Settings.DEFAULT_WAR);
             return Settings.DEFAULT_WAR;
         } else {
-            if (verbose) {
-                System.out.println("Will use war file: " + jenkinsWarFile);
-            }
+            logVerbose("Will use war file: " + jenkinsWarFile);
             return jenkinsWarFile;
         }
     }
@@ -272,6 +314,15 @@ class CliOptions {
     }
 
     /**
+     * Gets the value corresponding to if user selected to hide warnings for specified plugins
+     *
+     * @return true if user selected CLI Option to hide warnings for specified plugins
+     */
+    private boolean isHideWarnings() {
+        return hideWarnings;
+    }
+
+    /**
      * Gets the value corresponding to if the user selected to show security warnings for all plugins
      *
      * @return true if user selected CLI Option to see warnings for all plugins
@@ -303,25 +354,22 @@ class CliOptions {
         try {
             if (jenkinsUc != null) {
                 jenkinsUpdateCenter = new URL(appendFilePathIfNotPresent(jenkinsUc.toString()));
-                if (verbose) {
-                    System.out.println("Using update center " + jenkinsUpdateCenter + " specified with CLI option");
-                }
+                logVerbose("Using update center " + jenkinsUpdateCenter + " specified with CLI option");
             } else {
                 String jenkinsUcFromEnv = System.getenv("JENKINS_UC");
                 if (!StringUtils.isEmpty(jenkinsUcFromEnv)) {
                     jenkinsUpdateCenter = new URL(appendFilePathIfNotPresent(jenkinsUcFromEnv));
-                    if (verbose) {
-                        System.out.println("Using update center " + jenkinsUpdateCenter + " from JENKINS_UC environment variable");
-                    }
+                    logVerbose("Using update center " + jenkinsUpdateCenter + " from JENKINS_UC environment variable");
                 } else {
                     jenkinsUpdateCenter = Settings.DEFAULT_UPDATE_CENTER;
-                    if (verbose) {
-                        System.out.println("No CLI option or environment variable set for update center, using default of " +
-                                jenkinsUpdateCenter);
-                    }
+                    logVerbose("No CLI option or environment variable set for update center, using default of " + jenkinsUpdateCenter);
                 }
             }
         } catch (MalformedURLException e) {
+            /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+             * but the program cannot do anything with a malformed URL.
+             * Spotbugs warning is ignored.
+             */
             throw new RuntimeException(e);
         }
         return jenkinsUpdateCenter;
@@ -345,25 +393,20 @@ class CliOptions {
         try {
             if (jenkinsUcExperimental != null) {
                 experimentalUpdateCenter = new URL(appendFilePathIfNotPresent(jenkinsUcExperimental.toString()));
-                if (verbose) {
-                    System.out.println(
-                            "Using experimental update center " + experimentalUpdateCenter + " specified with CLI option");
-                }
+                logVerbose("Using experimental update center " + experimentalUpdateCenter + " specified with CLI option");
             } else if (!StringUtils.isEmpty(System.getenv("JENKINS_UC_EXPERIMENTAL"))) {
                 experimentalUpdateCenter = new URL(appendFilePathIfNotPresent(System.getenv("JENKINS_UC_EXPERIMENTAL")));
-                if (verbose) {
-                    System.out.println("Using experimental update center " + experimentalUpdateCenter +
-                            " from JENKINS_UC_EXPERIMENTAL environment variable");
-                }
+                logVerbose("Using experimental update center " + experimentalUpdateCenter + " from JENKINS_UC_EXPERIMENTAL environment variable");
             } else {
                 experimentalUpdateCenter = Settings.DEFAULT_EXPERIMENTAL_UPDATE_CENTER;
-                if (verbose) {
-                    System.out.println(
-                            "No CLI option or environment variable set for experimental update center, using default of " +
-                                    experimentalUpdateCenter);
-                }
+                logVerbose("No CLI option or environment variable set for experimental update center, using default of " +
+                        experimentalUpdateCenter);
             }
         } catch (MalformedURLException e) {
+            /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+             * but the program cannot do anything with a malformed URL.
+             * Spotbugs warning is ignored.
+             */
             throw new RuntimeException(e);
         }
         return experimentalUpdateCenter;
@@ -379,25 +422,24 @@ class CliOptions {
         URL jenkinsIncrementalsRepo;
         if (jenkinsIncrementalsRepoMirror != null) {
             jenkinsIncrementalsRepo = jenkinsIncrementalsRepoMirror;
-            if (verbose) {
-                System.out.println("Using incrementals mirror " + jenkinsIncrementalsRepo + " specified with CLI option");
-            }
+            logVerbose("Using incrementals mirror " + jenkinsIncrementalsRepo + " specified with CLI option");
         } else if (!StringUtils.isEmpty(System.getenv("JENKINS_INCREMENTALS_REPO_MIRROR"))) {
             try {
                 jenkinsIncrementalsRepo = new URL(System.getenv("JENKINS_INCREMENTALS_REPO_MIRROR"));
             } catch (MalformedURLException e) {
+            /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+             * but the program cannot do anything with a malformed URL.
+             * Spotbugs warning is ignored.
+             */
                 throw new RuntimeException(e);
             }
-            if (verbose) {
-                System.out.println("Using incrementals mirror " + jenkinsIncrementalsRepo +
-                        " from JENKINS_INCREMENTALS_REPO_MIRROR environment variable");
-            }
+
+            logVerbose("Using incrementals mirror " + jenkinsIncrementalsRepo +
+                    " from JENKINS_INCREMENTALS_REPO_MIRROR environment variable");
         } else {
             jenkinsIncrementalsRepo = Settings.DEFAULT_INCREMENTALS_REPO_MIRROR;
-            if (verbose) {
-                System.out.println("No CLI option or environment variable set for incrementals mirror, using default of " +
-                        jenkinsIncrementalsRepo);
-            }
+            logVerbose("No CLI option or environment variable set for incrementals mirror, using default of " +
+                    jenkinsIncrementalsRepo);
         }
         return jenkinsIncrementalsRepo;
     }
@@ -412,25 +454,22 @@ class CliOptions {
         URL pluginInfo;
         if (jenkinsPluginInfo != null) {
             pluginInfo = jenkinsPluginInfo;
-            if (verbose) {
-                System.out.println("Using plugin info " + jenkinsPluginInfo + " specified with CLI option");
-            }
+            logVerbose("Using plugin info " + jenkinsPluginInfo + " specified with CLI option");
         } else if (!StringUtils.isEmpty(System.getenv("JENKINS_PLUGIN_INFO"))) {
             try {
                 pluginInfo = new URL(System.getenv("JENKINS_PLUGIN_INFO"));
             } catch (MalformedURLException e) {
+                /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+                 * but the program cannot do anything with a malformed URL.
+                 * Spotbugs warning is ignored.
+                 */
                 throw new RuntimeException(e);
             }
-            if (verbose) {
-                System.out.println("Using plugin info " + pluginInfo +
-                        " from JENKINS_PLUGIN_INFO environment variable");
-            }
+
+            logVerbose("Using plugin info " + pluginInfo + " from JENKINS_PLUGIN_INFO environment variable");
         } else {
             pluginInfo = Settings.DEFAULT_PLUGIN_INFO;
-            if (verbose) {
-                System.out.println("No CLI option or environment variable set for plugin info, using default of " +
-                        pluginInfo);
-            }
+            logVerbose("No CLI option or environment variable set for plugin info, using default of " + pluginInfo);
         }
         return pluginInfo;
     }
@@ -446,7 +485,6 @@ class CliOptions {
     /**
      * Prints out the Plugin Management Tool version
      */
-    @SuppressFBWarnings("RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE")
     public void showVersion() {
         try (InputStream propertyInputStream = getPropertiesInputStream("/.properties")) {
             if (propertyInputStream == null) {
@@ -516,4 +554,34 @@ class CliOptions {
     public boolean isShowVersion() {
         return showVersion;
     }
+
+
+    /**
+     * Determines the hash function used with the Update Center
+     * set via environment variable only
+     *
+     * @return the string value for the hash function. Currently allows sha1, sha256(default), sha512
+     */
+    private HashFunction getHashFunction() {
+
+        String fromEnv = System.getenv("JENKINS_UC_HASH_FUNCTION");
+        if (StringUtils.isNotBlank(fromEnv)) {
+            return HashFunction.valueOf(fromEnv.toUpperCase());
+        } else {
+            return Settings.DEFAULT_HASH_FUNCTION;
+        }
+    }
+
+    /**
+     * Outputs information to the console (std err) if verbose option was set to true
+     *
+     * @param message informational string to output
+     */
+    private void logVerbose(String message) {
+        if (verbose) {
+            // log to stderr to not interfere with primary cli output sent to stdout
+            System.err.println(message);
+        }
+    }
+
 }

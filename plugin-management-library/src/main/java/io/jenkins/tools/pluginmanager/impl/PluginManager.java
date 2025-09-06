@@ -1,11 +1,23 @@
 package io.jenkins.tools.pluginmanager.impl;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.util.VersionNumber;
 import io.jenkins.tools.pluginmanager.config.Config;
-import io.jenkins.tools.pluginmanager.config.Settings;
+import io.jenkins.tools.pluginmanager.config.Credentials;
+import io.jenkins.tools.pluginmanager.config.HashFunction;
+import io.jenkins.tools.pluginmanager.config.LogOutput;
+import io.jenkins.tools.pluginmanager.parsers.PluginOutputConverter;
+import io.jenkins.tools.pluginmanager.parsers.StdOutPluginOutputConverter;
+import io.jenkins.tools.pluginmanager.parsers.TxtOutputConverter;
+import io.jenkins.tools.pluginmanager.parsers.YamlPluginOutputConverter;
+import io.jenkins.tools.pluginmanager.util.FileDownloadResponseHandler;
+import io.jenkins.tools.pluginmanager.util.ManifestTools;
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileFilter;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -18,40 +30,55 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
-import java.util.jar.Attributes;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.jar.JarFile;
-import java.util.jar.Manifest;
 import java.util.regex.Matcher;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import javax.annotation.CheckForNull;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.filefilter.WildcardFileFilter;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.http.HttpHost;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpHead;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.config.CookieSpecs;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.client.utils.URIBuilder;
-import org.apache.http.client.utils.URIUtils;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.BasicResponseHandler;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -59,40 +86,50 @@ import static io.jenkins.tools.pluginmanager.util.PluginManagerUtils.appendPathO
 import static io.jenkins.tools.pluginmanager.util.PluginManagerUtils.dirName;
 import static io.jenkins.tools.pluginmanager.util.PluginManagerUtils.removePath;
 import static io.jenkins.tools.pluginmanager.util.PluginManagerUtils.removePossibleWrapperText;
-import static java.util.Comparator.comparing;
-import static java.util.Comparator.reverseOrder;
 
-public class PluginManager {
-    private static final VersionNumber LATEST = new VersionNumber("latest");
-    private List<Plugin> failedPlugins;
-    private File refDir;
+public class PluginManager implements Closeable {
+    private static final VersionNumber LATEST = new VersionNumber(Plugin.LATEST);
+    private final List<Plugin> failedPlugins;
+    /**
+     * Directory where the plugins will be downloaded
+     */
+    private final File pluginDir;
     private String jenkinsUcLatest;
-    private File jenkinsWarFile;
+    private HashFunction hashFunction;
+    private final @CheckForNull VersionNumber jenkinsVersion;
+    private final @CheckForNull File jenkinsWarFile;
     private Map<String, Plugin> installedPluginVersions;
     private Map<String, Plugin> bundledPluginVersions;
     private Map<String, List<SecurityWarning>> allSecurityWarnings;
     private Map<String, Plugin> allPluginsAndDependencies;
     private Map<String, Plugin> effectivePlugins;
     private List<Plugin> pluginsToBeDownloaded;
-    private Config cfg;
+    private final Config cfg;
     private JSONObject latestUcJson;
     private JSONObject experimentalUcJson;
     private JSONObject pluginInfoJson;
     private JSONObject latestPlugins;
-    private boolean verbose;
-    private boolean useLatestSpecified;
-    private boolean useLatestAll;
-    private boolean skipFailedPlugins;
-
-    private CacheManager cm;
+    private JSONObject experimentalPlugins;
+    private final boolean verbose;
+    private final boolean useLatestSpecified;
+    private final boolean useLatestAll;
+    private final String userAgentInformation;
+    private final boolean skipFailedPlugins;
+    private CloseableHttpClient httpClient;
+    private final CacheManager cm;
+    private final LogOutput logOutput;
 
     private static final int DEFAULT_MAX_RETRIES = 3;
+    private static final String MIRROR_FALLBACK_BASE_URL = "https://archives.jenkins.io/";
 
     @SuppressFBWarnings(value = "PATH_TRAVERSAL_IN", justification = "we want the user to be able to specify a path")
     public PluginManager(Config cfg) {
         this.cfg = cfg;
-        refDir = cfg.getPluginDir();
-        jenkinsWarFile = new File(cfg.getJenkinsWar());
+        logOutput = cfg.getLogOutput();
+        pluginDir = cfg.getPluginDir();
+        jenkinsVersion = cfg.getJenkinsVersion();
+        final String warArg = cfg.getJenkinsWar();
+        jenkinsWarFile = warArg != null ? new File(warArg) : null;
         failedPlugins = new ArrayList<>();
         installedPluginVersions = new HashMap<>();
         bundledPluginVersions = new HashMap<>();
@@ -103,6 +140,45 @@ public class PluginManager {
         useLatestSpecified = cfg.isUseLatestSpecified();
         useLatestAll = cfg.isUseLatestAll();
         skipFailedPlugins = cfg.isSkipFailedPlugins();
+        hashFunction = cfg.getHashFunction();
+        httpClient = null;
+        userAgentInformation = this.getUserAgentInformation();
+        cm = new CacheManager(cfg.getCachePath(), cfg.getLogOutput());
+    }
+
+    private String getUserAgentInformation() {
+        String userAgentInformation = "JenkinsPluginManager";
+        Properties properties = new Properties();
+        try (InputStream propertiesStream = this.getClass().getClassLoader().getResourceAsStream("version.properties")) {
+            properties.load(propertiesStream);
+            userAgentInformation =  "JenkinsPluginManager/" + properties.getProperty("project.version");
+        } catch (IOException e) {
+            logVerbose("Not able to load/detect version.properties file");
+        }
+
+        String additionalUserAgentInfo = System.getProperty("http.agent");
+        if (additionalUserAgentInfo != null) {
+            userAgentInformation = additionalUserAgentInfo + " " + userAgentInformation;
+        }
+
+        return userAgentInformation;
+    }
+
+    private HttpClient getHttpClient() {
+        if (httpClient == null) {
+            RequestConfig globalConfig = RequestConfig.custom()
+                .setCookieSpec(CookieSpecs.STANDARD) // use modern cookie policy (RFC 6265)
+                .build();
+            httpClient = HttpClients.custom().useSystemProperties()
+                // there is a more complex retry handling in downloadToFile(...) on the whole flow
+                // this affects only the single request
+                .setRetryHandler(new DefaultHttpRequestRetryHandler(DEFAULT_MAX_RETRIES, true))
+                .setConnectionManager(new PoolingHttpClientConnectionManager())
+                .setUserAgent(userAgentInformation)
+                .setDefaultRequestConfig(globalConfig)
+                .build();
+        }
+        return httpClient;
     }
 
     /**
@@ -122,21 +198,29 @@ public class PluginManager {
      * @since TODO
      */
     public void start(boolean downloadUc) {
-        if (refDir.exists()) {
+        if (cfg.isCleanPluginDir() && pluginDir.exists()) {
             try {
-                FileUtils.deleteDirectory(refDir);
+                logVerbose("Cleaning up the target plugin directory: " + pluginDir);
+                File[] toBeDeleted = pluginDir.listFiles();
+                if (toBeDeleted != null) {
+                    for (File deletableFile : toBeDeleted) {
+                        FileUtils.forceDelete(deletableFile);
+                    }
+                }
             } catch (IOException e) {
-                throw new UncheckedIOException("Unable to delete: " + refDir.getAbsolutePath(), e);
+                throw new UncheckedIOException("Unable to delete: " + pluginDir.getAbsolutePath(), e);
             }
         }
-        createRefDir();
+        if (cfg.doDownload() && !pluginDir.exists()) {
+            createPluginDir(cfg.isCleanPluginDir());
+        }
 
         if (useLatestSpecified && useLatestAll) {
             throw new PluginDependencyStrategyException("Only one plugin dependency version strategy can be selected " +
                     "at a time");
         }
 
-        VersionNumber jenkinsVersion = getJenkinsVersionFromWar();
+        VersionNumber jenkinsVersion = getJenkinsVersion();
         if (downloadUc) {
             getUCJson(jenkinsVersion);
         }
@@ -144,26 +228,38 @@ public class PluginManager {
         showAllSecurityWarnings();
         bundledPluginVersions = bundledPlugins();
         installedPluginVersions = installedPlugins();
-
-        allPluginsAndDependencies = findPluginsAndDependencies(cfg.getPlugins());
+        List<Exception> exceptions = new ArrayList<>();
+        allPluginsAndDependencies = findPluginsAndDependencies(cfg.getPlugins(), exceptions);
         pluginsToBeDownloaded = findPluginsToDownload(allPluginsAndDependencies);
         effectivePlugins = findEffectivePlugins(pluginsToBeDownloaded);
 
         listPlugins();
         showSpecificSecurityWarnings(pluginsToBeDownloaded);
-        checkVersionCompatibility(jenkinsVersion, pluginsToBeDownloaded);
-
+        checkVersionCompatibility(jenkinsVersion, pluginsToBeDownloaded, exceptions);
+        if (!exceptions.isEmpty()) {
+            throw new AggregatePluginPrerequisitesNotMetException(exceptions);
+        }
         if (cfg.doDownload()) {
             downloadPlugins(pluginsToBeDownloaded);
         }
-        System.out.println("Done");
+        logMessage("Done");
     }
 
-    void createRefDir() {
+    void createPluginDir(boolean failIfExists) {
+        if (pluginDir.exists()) {
+            if (failIfExists) {
+                throw new DirectoryCreationException("The plugin directory already exists: " + pluginDir);
+            } else {
+                if (!pluginDir.isDirectory()) {
+                    throw new DirectoryCreationException("The plugin directory path is not a directory: " + pluginDir);
+                }
+                return;
+            }
+        }
         try {
-            Files.createDirectories(refDir.toPath());
+            Files.createDirectories(pluginDir.toPath());
         } catch (IOException e) {
-            throw new DirectoryCreationException("Unable to create plugin directory", e);
+            throw new DirectoryCreationException(String.format("Unable to create plugin directory: '%s', supply a directory with -d <your-directory>", pluginDir), e);
         }
     }
 
@@ -194,6 +290,8 @@ public class PluginManager {
                         installedPluginVersions.get(pluginName).getVersion();
             }
             if (installedVersion == null) {
+                logVerbose(String.format(
+                        "Will install new plugin %s %s", pluginName, plugin.getVersion()));
                 pluginsToDownload.add(plugin);
             } else if (installedVersion.isOlderThan(plugin.getVersion())) {
                 logVerbose(String.format(
@@ -241,14 +339,13 @@ public class PluginManager {
      * actually be downloaded based on the requested plugins and currently installed plugins, and the effective plugin
      * set, which includes all currently installed plugins and plugins that will be downloaded by the tool
      */
-    public void listPlugins() {
+    void listPlugins() {
         if (cfg.isShowPluginsToBeDownloaded()) {
-            logPlugins("Installed plugins:", new ArrayList<>(installedPluginVersions.values()));
+            logPlugins("\nInstalled plugins:", new ArrayList<>(installedPluginVersions.values()));
             logPlugins("Bundled plugins:", new ArrayList<>(bundledPluginVersions.values()));
-            logPlugins("Set of all requested plugins:", new ArrayList<>(allPluginsAndDependencies.values()));
-            logPlugins("Set of all requested plugins that will be downloaded:", pluginsToBeDownloaded);
-            logPlugins("Set of all existing plugins and plugins that will be downloaded:",
-                    new ArrayList<>(effectivePlugins.values()));
+            logPlugins("All requested plugins:", new ArrayList<>(allPluginsAndDependencies.values()));
+            logPlugins("Plugins that will be downloaded:", pluginsToBeDownloaded);
+            outputPluginList(new ArrayList<>(effectivePlugins.values()), () -> new StdOutPluginOutputConverter("Resulting plugin list:"));
         }
     }
 
@@ -258,11 +355,34 @@ public class PluginManager {
      * @param description string describing plugins to be printed
      * @param plugins     list of plugins to be output
      */
-    public void logPlugins(String description, List<Plugin> plugins) {
-        System.out.println("\n" + description);
-        plugins.stream()
-                .sorted(comparing(Plugin::getName).thenComparing(Plugin::getVersion))
-                .forEach(System.out::println);
+    private void logPlugins(String description, List<Plugin> plugins) {
+        logMessage(new StdOutPluginOutputConverter(description).convert(plugins));
+    }
+
+    /**
+     * Generate plugin list in the format requested by the user and output to standard out.
+     * @param plugins plugins to include in the list
+     * @param stdOutConverter if the output format is STDOUT, use the supplied converter.
+     */
+    public void outputPluginList(@NonNull List<Plugin> plugins, @NonNull Supplier<PluginOutputConverter> stdOutConverter) {
+        System.out.println(formatPluginsList(plugins, stdOutConverter));
+    }
+
+    /**
+     * Generate plugin list in the format requested by the user.
+     * @param plugins plugins to include in the list
+     * @param stdOutConverter if the output format is STDOUT, use the supplied converter.
+     */
+    private String formatPluginsList(@NonNull List<Plugin> plugins, @NonNull Supplier<PluginOutputConverter> stdOutConverter) {
+        switch (cfg.getOutputFormat()) {
+            case YAML:
+                return new YamlPluginOutputConverter().convert(plugins);
+            case TXT:
+                return new TxtOutputConverter().convert(plugins);
+            case STDOUT:
+            default:
+                return stdOutConverter.get().convert(plugins);
+        }
     }
 
     /**
@@ -273,11 +393,11 @@ public class PluginManager {
      */
     public Map<String, List<SecurityWarning>> getSecurityWarnings() {
         if (latestUcJson == null) {
-            System.out.println("Unable to get update center json");
+            logMessage("Unable to get update center json");
             return allSecurityWarnings;
         }
         if (!latestUcJson.has("warnings")) {
-            System.out.println("update center json has no warnings: ignoring");
+            logMessage("update center json has no warnings: ignoring");
             return allSecurityWarnings;
         }
         JSONArray warnings = latestUcJson.getJSONArray("warnings");
@@ -319,9 +439,12 @@ public class PluginManager {
      */
     public void showAllSecurityWarnings() {
         if (cfg.isShowAllWarnings()) {
-            allSecurityWarnings.values().stream().sorted().
-                    forEach(p -> p.stream().sorted().
-                            map(w -> w.getName() + " - " + w.getMessage()).forEach(System.out::println));
+            allSecurityWarnings.values()
+                    .stream()
+                    .flatMap(List::stream)
+                    .sorted(Comparator.comparing(SecurityWarning::getName))
+                    .map(w -> w.getName() + " - " + w.getMessage())
+                    .forEach(this::logMessage);
         }
     }
 
@@ -333,12 +456,18 @@ public class PluginManager {
      */
 
     public void showSpecificSecurityWarnings(List<Plugin> plugins) {
-        if (cfg.isShowWarnings()) {
-            System.out.println("\nSecurity warnings:");
+        // NOTE: By default, the plugin installation manager tool will show security warnings.
+        // see: https://github.com/jenkinsci/plugin-installation-manager-tool/issues/258
+        if (!cfg.isHideWarnings()) {
+            boolean headingDisplayed = false;
             for (Plugin plugin : plugins) {
                 if (warningExists(plugin)) {
+                    if (!headingDisplayed) {
+                        logMessage("\nSecurity warnings:");
+                        headingDisplayed = true;
+                    }
                     String pluginName = plugin.getName();
-                    System.out.println(plugin.getSecurityWarnings().stream()
+                    logMessage(plugin.getSecurityWarnings().stream()
                             .map(warning -> String.format("%s (%s): %s %s %s", pluginName,
                                     plugin.getVersion(), warning.getId(), warning.getMessage(), warning.getUrl())).
                                     collect(Collectors.joining("\n")));
@@ -356,40 +485,41 @@ public class PluginManager {
     public List<Plugin> getLatestVersionsOfPlugins(List<Plugin> plugins) {
         return plugins.stream()
                 .map(plugin -> {
-                    if (plugin.getUrl() != null || plugin.getGroupId() != null) {
+                    String pluginVersion = plugin.getVersion().toString();
+                    if (plugin.getUrl() != null || plugin.getGroupId() != null || pluginVersion.equals(Plugin.LATEST)) {
                         return plugin;
                     }
-                    JSONObject pluginsKey = (JSONObject) pluginInfoJson.get("plugins");
-                    if (pluginsKey.has(plugin.getName())) {
-                        JSONObject pluginInfo = (JSONObject) pluginsKey.get(plugin.getName());
-                        List<VersionNumber> sortedVersions = pluginInfo.toMap()
-                                .keySet().stream()
-                                .filter(version -> nonBetaPluginsDoNotOfferBeta(plugin.getVersion().toString(), version))
-                                .map(VersionNumber::new)
-                                .sorted(reverseOrder())
-                                .collect(Collectors.toList());
+                    if (latestPlugins == null) {
+                        throw new IllegalStateException("List of plugins is not available. Likely Update Center data has not been downloaded yet");
+                    }
 
-                        return new Plugin(plugin.getName(), sortedVersions.get(0).toString(), null, null);
+                    if (isBeta(pluginVersion)) {
+                        resolveExperimentalUcIfRequired();
+                        if (experimentalPlugins.has(plugin.getName())) {
+                            return getUpdatedPlugin(plugin, experimentalPlugins);
+                        }
+                    }
+
+                    if (latestPlugins.has(plugin.getName())) {
+                        return getUpdatedPlugin(plugin, latestPlugins);
                     }
                     return plugin;
                 })
                 .collect(Collectors.toList());
     }
 
-    /**
-     * If the plugin isn't a beta version then don't offer beta versions
-     */
-    private boolean nonBetaPluginsDoNotOfferBeta(String pluginVersion, String version) {
-        boolean offeredVersionNonBeta = isNonBeta(version);
-        if (offeredVersionNonBeta) {
-            return true;
+    private Plugin getUpdatedPlugin(Plugin plugin, JSONObject pluginsFromUpdateCenter) {
+        JSONObject pluginInfo = pluginsFromUpdateCenter.getJSONObject(plugin.getName());
+        VersionNumber versionNumber = new VersionNumber(pluginInfo.getString("version"));
+        if (versionNumber.isOlderThan(plugin.getVersion())) {
+            versionNumber = plugin.getVersion();
         }
 
-        return !isNonBeta(pluginVersion);
+        return new Plugin(plugin.getName(), versionNumber.toString(), null, null);
     }
 
-    private boolean isNonBeta(String version) {
-        return StringUtils.indexOfAny(version, "alpha", "beta") == -1;
+    private boolean isBeta(String version) {
+        return StringUtils.indexOfAny(version, "alpha", "beta") != -1;
     }
 
     /**
@@ -420,17 +550,36 @@ public class PluginManager {
      * Checks that required Jenkins version of all plugins to be downloaded is less than the Jenkins version in the
      * user specified Jenkins war file
      *
+     * @param jenkinsVersion the current version of Jenkins
      * @param pluginsToBeDownloaded list of plugins to check version compatibility with the Jenkins version
      */
     public void checkVersionCompatibility(VersionNumber jenkinsVersion, List<Plugin> pluginsToBeDownloaded) {
+        checkVersionCompatibility(jenkinsVersion, pluginsToBeDownloaded, null);
+    }
+
+    /**
+     * Checks that required Jenkins version of all plugins to be downloaded is less than the Jenkins version in the
+     * user specified Jenkins war file
+     *
+     * @param jenkinsVersion the current version of Jenkins
+     * @param pluginsToBeDownloaded list of plugins to check version compatibility with the Jenkins version
+     * @param exceptions if not null populated with the list of exception which occurred during this call, otherwise the exception is not caught
+     */
+    public void checkVersionCompatibility(VersionNumber jenkinsVersion, List<Plugin> pluginsToBeDownloaded, @CheckForNull List<Exception> exceptions) {
         if (jenkinsVersion != null && !StringUtils.isEmpty(jenkinsVersion.toString())) {
             for (Plugin p : pluginsToBeDownloaded) {
-                if (p.getJenkinsVersion() != null) {
-                    if (p.getJenkinsVersion().isNewerThan(jenkinsVersion)) {
-                        throw new VersionCompatibilityException(
-                                String.format("%n%s (%s) requires a greater version of Jenkins (%s) than %s in %s",
-                                        p.getName(), p.getVersion().toString(), p.getJenkinsVersion().toString(),
-                                        jenkinsVersion.toString(), jenkinsWarFile.toString()));
+                final VersionNumber pluginJenkinsVersion = p.getJenkinsVersion();
+                if (pluginJenkinsVersion!= null) {
+                    if (pluginJenkinsVersion.isNewerThan(jenkinsVersion)) {
+                        VersionCompatibilityException exception = new VersionCompatibilityException(
+                                String.format("%n%s (%s) requires a greater version of Jenkins (%s) than %s",
+                                        p.getName(), p.getVersion().toString(), pluginJenkinsVersion.toString(),
+                                        jenkinsVersion.toString()));
+                        if (exceptions != null) {
+                            exceptions.add(exception);
+                        } else {
+                            throw exception;
+                        }
                     }
                 }
             }
@@ -438,18 +587,27 @@ public class PluginManager {
     }
 
     /**
-     * Downloads a list of plugins
+     * Downloads a list of plugins.
+     * Plugins will be downloaded to a temporary directory, and then copied over to the final destination.
      *
      * @param plugins list of plugins to download
      */
+    @SuppressFBWarnings("PATH_TRAVERSAL_IN")
     public void downloadPlugins(List<Plugin> plugins) {
+        final File downloadsTmpDir;
+        try {
+            downloadsTmpDir = Files.createTempDirectory("plugin-installation-manager-downloads").toFile();
+        } catch (IOException ex) {
+            throw new DownloadPluginException("Cannot create a temporary directory for downloads", ex);
+        }
+
+        // Download to a temporary dir
         ForkJoinPool ioThreadPool = new ForkJoinPool(64);
         try {
             ioThreadPool.submit(() -> plugins.parallelStream().forEach(plugin -> {
-                boolean successfulDownload = downloadPlugin(plugin, null);
+                boolean successfulDownload = downloadPlugin(plugin, getPluginArchive(downloadsTmpDir, plugin));
                 if (skipFailedPlugins) {
-                    System.out.println(
-                            "SKIP: Unable to download " + plugin.getName());
+                    logMessage("SKIP: Unable to download " + plugin.getName());
                 } else if (!successfulDownload) {
                     throw new DownloadPluginException("Unable to download " + plugin.getName());
                 }
@@ -463,6 +621,51 @@ public class PluginManager {
                 e.printStackTrace();
             }
         }
+
+        // Filter out failed plugins
+        final List<Plugin> failedPlugins = getFailedPlugins();
+        if (!skipFailedPlugins && failedPlugins.size() > 0) {
+            throw new DownloadPluginException("Some plugin downloads failed: " +
+                    failedPlugins.stream().map(Plugin::getName).collect(Collectors.joining(",")) +
+                    ". See " + downloadsTmpDir.getAbsolutePath() + " for the temporary download directory");
+        }
+        Set<String> failedPluginNames = new HashSet<>(failedPlugins.size());
+        failedPlugins.forEach(plugin -> failedPluginNames.add(plugin.getName()));
+
+        // Copy files over to the destination directory
+        for (Plugin plugin : plugins) {
+            String archiveName = plugin.getArchiveFileName();
+            File downloadedPlugin = new File(downloadsTmpDir, archiveName);
+            try {
+                if (failedPluginNames.contains(plugin.getName())) {
+                    logMessage("Will skip the failed plugin download: " + plugin.getName() +
+                            ". See " + downloadedPlugin.getAbsolutePath() + " for the downloaded file");
+                }
+                // We do not double-check overrides here, because findPluginsToDownload() has already done it
+                File finalPath = new File(pluginDir, archiveName);
+                File backupPath = new File(pluginDir, plugin.getBackupFileName());
+                if (finalPath.isDirectory()) {
+                    // Jenkins supports storing plugins as unzipped files with ".jpi" extension
+                    FileUtils.cleanDirectory(finalPath);
+                    Files.delete(finalPath.toPath());
+                }
+                if (finalPath.exists()) {
+                    Files.move(finalPath.toPath(), backupPath.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+                Files.move(downloadedPlugin.toPath(), finalPath.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException ex) {
+                if (skipFailedPlugins) {
+                    logMessage("SKIP: Unable to move " + plugin.getName() + " to the plugin directory");
+                } else {
+                    throw new DownloadPluginException("Unable to move " + plugin.getName() + " to the plugin directory", ex);
+                }
+            }
+        }
+    }
+
+    @SuppressFBWarnings("PATH_TRAVERSAL_IN")
+    private File getPluginArchive(File pluginDir, Plugin plugin) {
+        return new File(pluginDir, plugin.getArchiveFileName());
     }
 
     /**
@@ -473,6 +676,18 @@ public class PluginManager {
      * @return set of all requested plugins and their recursive dependencies
      */
     public Map<String, Plugin> findPluginsAndDependencies(List<Plugin> requestedPlugins) {
+        return findPluginsAndDependencies(requestedPlugins, null);
+    }
+
+    /**
+     * Given a list of plugins, finds the recursive set of all dependent plugins. If multiple plugins rely on different
+     * versions of the same plugin, the higher version required will replace the lower version dependency
+     *
+     * @param requestedPlugins list of plugins to find all dependencies for
+     * @param exceptions if not null populated with the list of exception which occurred during this call, otherwise the exception is not caught
+     * @return set of all requested plugins and their recursive dependencies
+     */
+    public Map<String, Plugin> findPluginsAndDependencies(List<Plugin> requestedPlugins, @CheckForNull List<Exception> exceptions) {
         // Prepare the initial list by putting all explicitly requested plugins
         Map<String, Plugin> topLevelDependencies = new HashMap<>();
         for (Plugin requestedPlugin : requestedPlugins) {
@@ -481,24 +696,73 @@ public class PluginManager {
         Map<String, Plugin> allPluginDependencies = new HashMap<>(topLevelDependencies);
 
         for (Plugin requestedPlugin : requestedPlugins) {
+            calculateChecksum(requestedPlugin);
             //for each requested plugin, find all the dependent plugins that will be downloaded (including requested plugin)
-            Map<String, Plugin> dependencies = resolveRecursiveDependencies(requestedPlugin, topLevelDependencies);
+            Map<String, Plugin> dependencies = resolveRecursiveDependencies(requestedPlugin, topLevelDependencies, exceptions);
 
             for (Plugin dependentPlugin : dependencies.values()) {
                 String dependencyName = dependentPlugin.getName();
                 VersionNumber dependencyVersion = dependentPlugin.getVersion();
+                calculateChecksum(requestedPlugin);
                 if (!allPluginDependencies.containsKey(dependencyName)) {
                     allPluginDependencies.put(dependencyName, dependentPlugin);
                 } else {
                     Plugin existingDependency = allPluginDependencies.get(dependencyName);
-                    if (existingDependency.getVersion().isOlderThan(dependencyVersion)) {
-                        outputPluginReplacementInfo(existingDependency, dependentPlugin);
-                        allPluginDependencies.replace(existingDependency.getName(), dependentPlugin);
-                    }
+                    allPluginDependencies.replace(existingDependency.getName(),
+                            combineDependencies(existingDependency, dependentPlugin));
                 }
             }
         }
-        return allPluginDependencies;
+        return removeOptional(allPluginDependencies);
+    }
+
+    private Map<String, Plugin> removeOptional(Map<String, Plugin> plugins) {
+        Map<String, Plugin> filtered = new HashMap<>();
+        for (Map.Entry<String, Plugin> entry : plugins.entrySet()) {
+            if (!entry.getValue().getOptional()) {
+                filtered.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return filtered;
+    }
+
+    // Return a new dependency which is the intersection of the two given dependencies. The rules
+    // for determining this are as follows:
+    // - The resulting plugin is optional iff both the given plugins are optional
+    // - the resulting plugin will have the higher of the given versions
+    // - any remaining plugin attributes will come from the plugin with the higher version
+    private Plugin combineDependencies(Plugin a, Plugin b) {
+        if (!a.getName().equals(b.getName())) {
+            throw new IllegalStateException("Can only combine dependencies on the same plugin. Got " + a.getName() + " and " + b.getName());
+        }
+
+        boolean resultIsOptional = a.getOptional() && b.getOptional();
+
+        Plugin higherVersion = a;
+        if (a.getVersion().isOlderThan(b.getVersion())) {
+            higherVersion = b;
+        }
+
+        higherVersion.setOptional(resultIsOptional);
+        return higherVersion;
+    }
+
+    private void calculateChecksum(Plugin requestedPlugin) {
+        if (latestPlugins.has(requestedPlugin.getName())) {
+            JSONObject pluginFromUpdateCenter = latestPlugins.getJSONObject(requestedPlugin.getName());
+
+            String versionInUpdateCenter = pluginFromUpdateCenter.getString("version");
+            if (versionInUpdateCenter.equals(requestedPlugin.getVersion().toString())) {
+
+                String checksum = pluginFromUpdateCenter.getString(getHashFunction().toString());
+                logVerbose("Setting checksum for: " + requestedPlugin.getName() + " to " + checksum);
+                requestedPlugin.setChecksum(checksum);
+            } else if (requestedPlugin.getChecksum() == null) {
+                logVerbose("Couldn't find checksum for " + requestedPlugin.getName() + " at version: " + requestedPlugin.getVersion().toString());
+            }
+        } else if (requestedPlugin.getChecksum() == null) {
+            logVerbose("Couldn't find checksum for: " + requestedPlugin.getName());
+        }
     }
 
     /**
@@ -525,7 +789,7 @@ public class PluginManager {
      *
      * @param urlString string representing the url from which to get the json object
      * @deprecated see {@link #getJson(URL, String)}
-     * @return json object
+     * @return JSON object from data provided by the URL at urlString
      */
     @Deprecated
     public JSONObject getJson(String urlString) {
@@ -553,19 +817,24 @@ public class PluginManager {
     public JSONObject getJson(URL url, String cacheKey) {
         JSONObject jsonObject = cm.retrieveFromCache(cacheKey);
         if (jsonObject != null) {
-            if (verbose) {
-                System.out.println("Returning cached value for: " + cacheKey);
-            }
+            logVerbose("Returning cached value for: " + cacheKey);
             return jsonObject;
         } else {
-            if (verbose) {
-                System.out.println("Cache miss for: " + cacheKey);
-            }
+            logVerbose("Cache miss for: " + cacheKey);
         }
-
+        final String response;
         try {
-            String urlText = IOUtils.toString(url, StandardCharsets.UTF_8);
-            String result = removePossibleWrapperText(urlText);
+            if (url.getProtocol().equalsIgnoreCase("http") || url.getProtocol().equalsIgnoreCase("https")) {
+                response = getViaHttpWithResponseHandler(
+                  url.toString(),
+                  new BasicResponseHandler(),
+                  cacheKey,
+                  e -> String.format("Unable to retrieve JSON from %s: %s", url, e.getMessage()),
+                  3);
+            } else {
+                response = IOUtils.toString(url, StandardCharsets.UTF_8);
+            }
+            String result = removePossibleWrapperText(response);
             JSONObject json = new JSONObject(result);
             cm.addToCache(cacheKey, json);
             return json;
@@ -580,22 +849,31 @@ public class PluginManager {
      */
     public void getUCJson(VersionNumber jenkinsVersion) {
         logVerbose("\nRetrieving update center information");
-        cm = new CacheManager(Settings.DEFAULT_CACHE_PATH, verbose);
         cm.createCache();
 
-        String cacheSuffix = jenkinsVersion != null ? "-" + jenkinsVersion.toString(): "";
+        String cacheSuffix = getCacheSuffix(jenkinsVersion);
         try {
             URIBuilder uriBuilder = new URIBuilder(cfg.getJenkinsUc().toURI());
             if (jenkinsVersion != null) {
                 uriBuilder.addParameter("version", jenkinsVersion.toString()).build();
             }
-            latestUcJson = getJson(uriBuilder.build().toURL(), "update-center" + cacheSuffix);
+            URL url = uriBuilder.build().toURL();
+            logVerbose("Update center URL: " + url);
+
+            latestUcJson = getJson(url, "update-center" + cacheSuffix);
         } catch (MalformedURLException | URISyntaxException e) {
+            /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+             * but the program cannot do anything with a malformed URL.
+             * Spotbugs warning is ignored.
+             */
             throw new RuntimeException(e);
         }
         latestPlugins = latestUcJson.getJSONObject("plugins");
-        experimentalUcJson = getJson(cfg.getJenkinsUcExperimental(), "experimental-update-center" + cacheSuffix);
         pluginInfoJson = getJson(cfg.getJenkinsPluginInfo(), "plugin-versions");
+    }
+
+    private static String getCacheSuffix(VersionNumber jenkinsVersion) {
+        return jenkinsVersion != null ? "-" + jenkinsVersion : "";
     }
 
     /**
@@ -617,6 +895,9 @@ public class PluginManager {
             //plugin-versions.json has a slightly different structure than other update center json
             if (pluginInfo.has(plugin.getVersion().toString())) {
                 JSONObject specificVersionInfo = pluginInfo.getJSONObject(plugin.getVersion().toString());
+                String checksum = specificVersionInfo.getString(getHashFunction().toString());
+                logVerbose("Setting checksum for: " + plugin.getName() + " to " + checksum);
+                plugin.setChecksum(checksum);
                 plugin.setJenkinsVersion(specificVersionInfo.getString("requiredCore"));
                 return (JSONArray) specificVersionInfo.get("dependencies");
             }
@@ -633,17 +914,18 @@ public class PluginManager {
     /**
      * Retrieves the latest available version of a specified plugin.
      *
+     * @param dependendantPlugin the plugin depending on the given plugin
      * @param pluginName the name of the plugin
      * @return latest version of the specified plugin
      * @throws IllegalStateException Update Center JSON has not been retrieved yet
      */
-    public VersionNumber getLatestPluginVersion(String pluginName) {
+    public VersionNumber getLatestPluginVersion(Plugin dependendantPlugin, String pluginName) {
         if (latestPlugins == null) {
             throw new IllegalStateException("List of plugins is not available. Likely Update Center data has not been downloaded yet");
         }
 
         if (!latestPlugins.has(pluginName)) {
-            throw new PluginNotFoundException(String.format("Unable to find plugin %s in update center %s", pluginName,
+            throw new PluginNotFoundException(dependendantPlugin, String.format("unable to find dependant plugin %s in update center %s", pluginName,
                     jenkinsUcLatest));
         }
 
@@ -662,6 +944,7 @@ public class PluginManager {
      * @return list of dependencies that were parsed from the plugin's manifest file
      */
     public List<Plugin> resolveDependenciesFromManifest(Plugin plugin) {
+        // TODO(oleg_nenashev): refactor to use ManifestTools. This logic not only resolves dependencies, but also modifies the plugin's metadata
         List<Plugin> dependentPlugins = new ArrayList<>();
         try {
             File tempFile = Files.createTempFile(FilenameUtils.getName(plugin.getName()), ".jpi").toFile();
@@ -669,17 +952,25 @@ public class PluginManager {
                     String.format("%nResolving dependencies of %s by downloading plugin to temp file %s and parsing " +
                             "MANIFEST.MF", plugin.getName(), tempFile.toString()));
             if (!downloadPlugin(plugin, tempFile)) {
-                Files.delete(tempFile.toPath());
+                Files.deleteIfExists(tempFile.toPath());
                 throw new DownloadPluginException("Unable to resolve dependencies for " + plugin.getName());
             }
 
-            if (plugin.getVersion().toString().equals("latest") ||
-                    plugin.getVersion().toString().equals("experimental")) {
+            if (plugin.getVersion().toString().equals(Plugin.LATEST) ||
+                    plugin.getVersion().toString().equals(Plugin.EXPERIMENTAL)) {
                 String version = getAttributeFromManifest(tempFile, "Plugin-Version");
                 if (!StringUtils.isEmpty(version)) {
                     plugin.setVersion(new VersionNumber(version));
                 }
             }
+            String minimumJenkinsVersion = getAttributeFromManifest(tempFile, "Jenkins-Version");
+            if (minimumJenkinsVersion == null) {
+                minimumJenkinsVersion = getAttributeFromManifest(tempFile, "Hudson-Version");
+            }
+            if (minimumJenkinsVersion == null) {
+                throw new PluginDependencyException(plugin, "does not contain a Jenkins-Version attribute in the MANIFEST.MF");
+            }
+            plugin.setJenkinsVersion(minimumJenkinsVersion);
 
             String dependencyString = getAttributeFromManifest(tempFile, "Plugin-Dependencies");
 
@@ -690,22 +981,17 @@ public class PluginManager {
             }
             String[] dependencies = dependencyString.split(",");
 
-            //ignore optional dependencies
             for (String dependency : dependencies) {
-                if (!dependency.contains("resolution:=optional")) {
-                    String[] pluginInfo = dependency.split(":");
-                    String pluginName = pluginInfo[0];
-                    String pluginVersion = pluginInfo[1];
-                    Plugin dependentPlugin = new Plugin(pluginName, pluginVersion, null, null);
-                    if (useLatestSpecified && plugin.isLatest() || useLatestAll) {
-                        VersionNumber latestPluginVersion = getLatestPluginVersion(pluginName);
-                        dependentPlugin.setVersion(latestPluginVersion);
-                        dependentPlugin.setLatest(true);
-                    }
+                String[] pluginInfo = dependency
+                        .replace(";resolution:=optional", "")
+                        .split(":");
+                String pluginName = pluginInfo[0];
+                String pluginVersion = pluginInfo[1];
+                Plugin dependentPlugin = new Plugin(pluginName, pluginVersion, null, null);
+                dependentPlugin.setOptional(dependency.contains("resolution:=optional"));
 
-                    dependentPlugins.add(dependentPlugin);
-                    dependentPlugin.setParent(plugin);
-                }
+                dependentPlugins.add(dependentPlugin);
+                dependentPlugin.setParent(plugin);
             }
             logVerbose(dependentPlugins.isEmpty() ? String.format("%n%s has no dependencies", plugin.getName()) :
                     String.format("%n%s depends on: %n", plugin.getName()) +
@@ -713,21 +999,18 @@ public class PluginManager {
                                     .map(p -> p.getName() + " " + p.getVersion())
                                     .collect(Collectors.joining("\n")));
 
-            plugin.setJenkinsVersion(getAttributeFromManifest(tempFile, "Jenkins-Version"));
             Files.delete(tempFile.toPath());
             return dependentPlugins;
         } catch (IOException e) {
-            System.out.println(String.format("Unable to resolve dependencies for %s", plugin.getName()));
-            if (verbose) {
-                e.printStackTrace();
-            }
+            logMessage(String.format("Unable to resolve dependencies for %s", plugin.getName()));
+            logOutput.printVerboseStacktrace(e);
             return dependentPlugins;
         }
     }
 
     /**
      * Given a plugin and json that contains plugin information, determines the dependencies and returns the list of
-     * dependencies. Optional dependencies will be excluded.
+     * dependencies.
      *
      * @param plugin     for which to find dependencies
      * @param pluginJson json that will be parsed to find requested plugin's dependencies
@@ -743,19 +1026,12 @@ public class PluginManager {
 
         for (int i = 0; i < dependencies.length(); i++) {
             JSONObject dependency = dependencies.getJSONObject(i);
-            boolean isPluginOptional = dependency.getBoolean("optional");
-            if (!isPluginOptional) {
-                String pluginName = dependency.getString("name");
-                String pluginVersion = dependency.getString("version");
-                Plugin dependentPlugin = new Plugin(pluginName, pluginVersion, null, null);
-                if (useLatestSpecified && plugin.isLatest() || useLatestAll) {
-                    VersionNumber latestPluginVersion = getLatestPluginVersion(pluginName);
-                    dependentPlugin.setVersion(latestPluginVersion);
-                    dependentPlugin.setLatest(true);
-                }
-                dependentPlugins.add(dependentPlugin);
-                dependentPlugin.setParent(plugin);
-            }
+            String pluginName = dependency.getString("name");
+            String pluginVersion = dependency.getString("version");
+            Plugin dependentPlugin = new Plugin(pluginName, pluginVersion, null, null);
+            dependentPlugin.setOptional(dependency.getBoolean("optional"));
+            dependentPlugin.setParent(plugin);
+            dependentPlugins.add(dependentPlugin);
         }
 
         logVerbose(dependentPlugins.isEmpty() ? String.format("%n%s has no dependencies", plugin.getName()) :
@@ -785,9 +1061,11 @@ public class PluginManager {
         if (!StringUtils.isEmpty(plugin.getUrl()) || !StringUtils.isEmpty(plugin.getGroupId())) {
             dependentPlugins = resolveDependenciesFromManifest(plugin);
             return dependentPlugins;
-        } else if (version.equals("latest")) {
+        } else if (version.equals(Plugin.LATEST)) {
             dependentPlugins = resolveDependenciesFromJson(plugin, latestUcJson);
-        } else if (version.equals("experimental")) {
+        } else if (version.equals(Plugin.EXPERIMENTAL)) {
+            resolveExperimentalUcIfRequired();
+
             dependentPlugins = resolveDependenciesFromJson(plugin, experimentalUcJson);
         } else {
             dependentPlugins = resolveDependenciesFromJson(plugin, pluginInfoJson);
@@ -799,6 +1077,16 @@ public class PluginManager {
         return dependentPlugins;
     }
 
+    private void resolveExperimentalUcIfRequired() {
+        if (experimentalPlugins == null) {
+            experimentalUcJson = getJson(
+                    cfg.getJenkinsUcExperimental(),
+                    "experimental-update-center" + getCacheSuffix(getJenkinsVersion())
+            );
+            experimentalPlugins = experimentalUcJson.getJSONObject("plugins");
+        }
+    }
+
     /**
      * Finds all recursive dependencies for a given plugin. If the same plugin is required by different plugins, the
      * highest required version will be taken.
@@ -808,12 +1096,15 @@ public class PluginManager {
      * the requested plugin itself
      */
     public Map<String, Plugin> resolveRecursiveDependencies(Plugin plugin) {
-        return resolveRecursiveDependencies(plugin, null);
+        return resolveRecursiveDependencies(plugin, null, null);
     }
 
-    // TODO(oleg_nenashev): This method is private, because it is only a partial fix for https://github.com/jenkinsci/plugin-installation-manager-tool/issues/101
+    public Map<String, Plugin> resolveRecursiveDependencies(Plugin plugin, @CheckForNull Map<String, Plugin> topLevelDependencies) {
+        return resolveRecursiveDependencies(plugin, topLevelDependencies, null);
+    }
+
     // A full dependency graph resolution and removal of non-needed dependency trees is required
-    private Map<String, Plugin> resolveRecursiveDependencies(Plugin plugin, @CheckForNull Map<String, Plugin> topLevelDependencies) {
+    public Map<String, Plugin> resolveRecursiveDependencies(Plugin plugin, @CheckForNull Map<String, Plugin> topLevelDependencies, @CheckForNull List<Exception> exceptions) {
         Deque<Plugin> queue = new LinkedList<>();
         Map<String, Plugin> recursiveDependencies = new HashMap<>();
         queue.add(plugin);
@@ -822,38 +1113,77 @@ public class PluginManager {
         while (queue.size() != 0) {
             Plugin dependency = queue.poll();
 
-            if (!dependency.isDependenciesSpecified()) {
-                dependency.setDependencies(resolveDirectDependencies(dependency));
+            try {
+                if (!dependency.isDependenciesSpecified()) {
+                    dependency.setDependencies(resolveDirectDependencies(dependency));
+                }
+            } catch (RuntimeException e) {
+                if (!(e instanceof PluginException)) {
+                    e = new PluginDependencyException(dependency, String.format("has unresolvable dependencies: %s", e.getMessage()), e);
+                }
+                if (exceptions != null) {
+                    exceptions.add(e);
+                } else {
+                    /* Spotbugs 4.7.0 warns when throwing a runtime exception,
+                     * but the program cannot do anything with unexpected runtime
+                     * exceptions except throw them or record them in the list of
+                     * exceptions for processing by the caller.
+                     * Spotbugs warning is ignored.
+                     */
+                    throw e;
+                }
+                continue;
             }
-
             for (Plugin p : dependency.getDependencies()) {
                 String dependencyName = p.getName();
                 Plugin pinnedPlugin = topLevelDependencies != null ? topLevelDependencies.get(dependencyName) : null;
 
-                // See https://github.com/jenkinsci/plugin-installation-manager-tool/pull/102
                 if (pinnedPlugin != null) { // There is a top-level plugin with the same ID
-                    if (pinnedPlugin.getVersion().isNewerThanOrEqualTo(p.getVersion()) || pinnedPlugin.getVersion().equals(LATEST)) {
-                        if (verbose) {
-                            logVerbose(String.format("Skipping dependency %s:%s and its sub-dependencies, because there is a higher version defined on the top level - %s:%s",
-                                    p.getName(), p.getVersion(), pinnedPlugin.getName(), pinnedPlugin.getVersion()));
+                    if (pinnedPlugin.getVersion().isOlderThan(p.getVersion()) && !pinnedPlugin.getVersion().equals(LATEST)) {
+                        String message = String.format("depends on %s:%s, but there is an older version defined on the top level - %s:%s",
+                                p.getName(), p.getVersion(), pinnedPlugin.getName(), pinnedPlugin.getVersion());
+                        PluginDependencyException exception = new PluginDependencyException(dependency, message);
+                        if (exceptions != null) {
+                            exceptions.add(exception);
+                        } else {
+                            throw exception;
                         }
-                        continue;
                     } else {
-                        String message = String.format("Plugin %s:%s depends on %s:%s, but there is an older version defined on the top level - %s:%s",
-                                plugin.getName(), plugin.getVersion(), p.getName(), p.getVersion(), pinnedPlugin.getName(), pinnedPlugin.getVersion());
-                        throw new PluginDependencyStrategyException(message);
+                        logVerbose(String.format("Skipping dependency %s:%s and its sub-dependencies, because there is a higher version defined on the top level - %s:%s",
+                                        p.getName(), p.getVersion(), pinnedPlugin.getName(), pinnedPlugin.getVersion()));
+                        continue;
+                    }
+                } else if (useLatestSpecified && dependency.isLatest() || useLatestAll) {
+                    try {
+                        VersionNumber latestPluginVersion = getLatestPluginVersion(dependency, p.getName());
+                        p.setVersion(latestPluginVersion);
+                        p.setLatest(true);
+                    } catch (PluginNotFoundException e) {
+                        if (!p.getOptional()) {
+                            throw e;
+                        }
+                        logVerbose(String.format(
+                                    "%s unable to find optional plugin %s in update center %s. " +
+                                    "Ignoring until it becomes required.", e.getOriginatorPluginAndDependencyChain(),
+                                    dependencyName, jenkinsUcLatest));
                     }
                 }
 
                 if (!recursiveDependencies.containsKey(dependencyName)) {
                     recursiveDependencies.put(dependencyName, p);
-                    queue.add(p);
+                    if (!p.getOptional()) {
+                        // If/when this dependency becomes non-optional, we will expand its dependencies.
+                        queue.add(p);
+                    }
                 } else {
                     Plugin existingDependency = recursiveDependencies.get(dependencyName);
-                    if (existingDependency.getVersion().isOlderThan(p.getVersion())) {
-                        outputPluginReplacementInfo(existingDependency, p);
-                        queue.add(p); //in case the higher version contains dependencies the lower version didn't have
-                        recursiveDependencies.replace(dependencyName, existingDependency, p);
+                    Plugin newDependency = combineDependencies(existingDependency, p);
+                    if (!newDependency.equals(existingDependency)) {
+                        outputPluginReplacementInfo(existingDependency, newDependency);
+                        recursiveDependencies.replace(dependencyName, existingDependency, newDependency);
+                        // newDependency may have additional dependencies if it is a higher version or
+                        // if it became non-optional.
+                        queue.add(newDependency);
                     }
                 }
             }
@@ -863,14 +1193,15 @@ public class PluginManager {
 
     /**
      * Downloads a plugin, skipping if already installed or bundled in the war. A plugin's dependencies will be
-     * resolved after the plugin is downloaded.
+     * resolved after the plugin is downloaded/copied.
      *
      * @param plugin   to download
-     * @param location location to download plugin to. If location is set to null, will download to the plugin folder
+     * @param location location to download plugin to. If location is set to {@code null}, will download to the plugin folder
      *                 otherwise will download to the temporary location specified.
+     *                 Location can be in form of a http://, https:// or file:// URI
      * @return boolean signifying if plugin was successful
      */
-    public boolean downloadPlugin(Plugin plugin, File location) {
+    public boolean downloadPlugin(Plugin plugin, @CheckForNull File location) {
         String pluginName = plugin.getName();
         VersionNumber pluginVersion = plugin.getVersion();
         // location will be populated if downloading a plugin to a temp file to determine dependencies
@@ -884,7 +1215,7 @@ public class PluginManager {
         String pluginDownloadUrl = getPluginDownloadUrl(plugin);
         boolean successfulDownload = downloadToFile(pluginDownloadUrl, plugin, location);
         if (successfulDownload && location == null) {
-            System.out.println(String.format("%s downloaded successfully", plugin.getName()));
+            logMessage(String.format("%s downloaded successfully", plugin.getName()));
             installedPluginVersions.put(plugin.getName(), plugin);
         }
         return successfulDownload;
@@ -906,35 +1237,27 @@ public class PluginManager {
         String urlString;
 
         if (StringUtils.isEmpty(pluginVersion)) {
-            pluginVersion = "latest";
+            pluginVersion = Plugin.LATEST;
         }
 
-        String jenkinsUcDownload =  System.getenv("JENKINS_UC_DOWNLOAD");
-        if (StringUtils.isNotEmpty(jenkinsUcDownload)) {
-            urlString = appendPathOntoUrl(jenkinsUcDownload, "/download/plugins", pluginName, pluginVersion, pluginName + ".hpi");
-        } else if (StringUtils.isNotEmpty(pluginUrl)) {
+        String jenkinsUcDownload = System.getenv("JENKINS_UC_DOWNLOAD");
+        String jenkinsUcDownloadUrl = System.getenv("JENKINS_UC_DOWNLOAD_URL");
+
+        if (StringUtils.isNotEmpty(pluginUrl)) {
             urlString = pluginUrl;
-        } else if ((pluginVersion.equals("latest") || plugin.isLatest()) && !StringUtils.isEmpty(jenkinsUcLatest)) {
-            JSONObject plugins = latestUcJson.getJSONObject("plugins");
-            if (plugins.has(plugin.getName())) {
-                JSONObject pluginJson = plugins.getJSONObject(plugin.getName());
-                urlString = pluginJson.getString("url");
-            } else {
-                urlString = appendPathOntoUrl(dirName(jenkinsUcLatest), "/latest", pluginName + ".hpi");
-            }
-        } else if (pluginVersion.equals("experimental") || plugin.isExperimental()) {
-            JSONObject plugins = experimentalUcJson.getJSONObject("plugins");
-            if (plugins.has(plugin.getName())) {
-                JSONObject pluginJson = plugins.getJSONObject(plugin.getName());
-                urlString = pluginJson.getString("url");
-            } else {
-                urlString = appendPathOntoUrl(dirName(cfg.getJenkinsUcExperimental()), "/latest", pluginName + ".hpi");
-            }
+        } else if (StringUtils.isNotEmpty(jenkinsUcDownloadUrl)) {
+            urlString = appendPathOntoUrl(jenkinsUcDownloadUrl, pluginName, pluginVersion, pluginName + ".hpi");
+        } else if (pluginVersion.equals(Plugin.LATEST) && !StringUtils.isEmpty(jenkinsUcLatest)) {
+            urlString = appendPathOntoUrl(dirName(jenkinsUcLatest), "/latest", pluginName + ".hpi");
+        } else if (pluginVersion.equals(Plugin.EXPERIMENTAL)) {
+            urlString = appendPathOntoUrl(dirName(cfg.getJenkinsUcExperimental()), "/latest", pluginName + ".hpi");
         } else if (!StringUtils.isEmpty(plugin.getGroupId())) {
             String groupId = plugin.getGroupId();
             groupId = groupId.replace(".", "/");
             String incrementalsVersionPath = String.format("%s/%s/%s-%s.hpi", pluginName, pluginVersion, pluginName, pluginVersion);
             urlString = appendPathOntoUrl(cfg.getJenkinsIncrementalsRepoMirror(), groupId, incrementalsVersionPath);
+        } else if (StringUtils.isNotEmpty(jenkinsUcDownload)) {
+            urlString = appendPathOntoUrl(jenkinsUcDownload, "/plugins", pluginName, pluginVersion, pluginName + ".hpi");
         } else {
             urlString = appendPathOntoUrl(removePath(cfg.getJenkinsUc()), "/download/plugins", pluginName, pluginVersion, pluginName + ".hpi");
         }
@@ -952,7 +1275,7 @@ public class PluginManager {
      *                     be null
      * @return true if download is successful, false otherwise
      */
-    public boolean downloadToFile(String urlString, Plugin plugin, File fileLocation) {
+    public boolean downloadToFile(String urlString, Plugin plugin, @CheckForNull File fileLocation) {
         return downloadToFile(urlString, plugin, fileLocation, DEFAULT_MAX_RETRIES);
     }
 
@@ -967,100 +1290,243 @@ public class PluginManager {
      * @param maxRetries   Maximum number of times to retry the download before failing
      * @return true if download is successful, false otherwise
      */
-    @SuppressFBWarnings({"RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE", "PATH_TRAVERSAL_IN"})
-    public boolean downloadToFile(String urlString, Plugin plugin, File fileLocation, int maxRetries) {
+    @SuppressFBWarnings("PATH_TRAVERSAL_IN")
+    public boolean downloadToFile(String urlString, Plugin plugin, @CheckForNull File fileLocation, int maxRetries) {
         File pluginFile;
         if (fileLocation == null) {
-            pluginFile = new File(refDir, plugin.getArchiveFileName());
-            System.out.println("\nDownloading plugin " + plugin.getName() + " from url: " + urlString);
+            pluginFile = new File(pluginDir, plugin.getArchiveFileName());
+            logMessage("\nDownloading plugin " + plugin.getName() + " from url: " + urlString);
         } else {
             pluginFile = fileLocation;
         }
 
         boolean success = true;
-        for (int i = 0; i < maxRetries; i++) {
-            try {
-                if (pluginFile.exists()) {
-                    Files.delete(pluginFile.toPath());
-                }
-            } catch (IOException e) {
-                logVerbose(String.format("Unable to delete %s before retry %d", pluginFile, i + 1));
-            }
 
-            try (CloseableHttpClient httpclient = HttpClients.custom().useSystemProperties()
-                    .setRetryHandler(new DefaultHttpRequestRetryHandler(maxRetries, true))
-                    .build()) {
-                HttpClientContext context = HttpClientContext.create();
-                HttpHead httphead = new HttpHead(urlString);
-                try (CloseableHttpResponse ignored = httpclient.execute(httphead, context)) {
-                    HttpHost target = context.getTargetHost();
-                    List<URI> redirectLocations = context.getRedirectLocations();
-                    // Expected to be an absolute URI
-                    URI location = URIUtils.resolve(httphead.getURI(), target, redirectLocations);
-                    FileUtils.copyURLToFile(location.toURL(), pluginFile);
-                } catch (URISyntaxException | IOException e) {
-                    logVerbose(String.format("Unable to resolve plugin URL %s, or download plugin %s to file",
-                            urlString, plugin.getName()));
-                    success = false;
-                }
-            } catch (IOException e) {
-                System.out.println("Unable to create HTTP connection to download plugin");
-                success = false;
-            }
+        if(urlString.startsWith("http://") || urlString.startsWith("https://")){
+            success = downloadHttpToFile(urlString, plugin, pluginFile, maxRetries);
 
-            // Check integrity of plugin file
-            if (success) {
-                try (JarFile ignored = new JarFile(pluginFile)) {
-                    plugin.setFile(pluginFile);
-                } catch (IOException e) {
-                    System.out.println("Downloaded file for " + plugin.getName() + " is not a valid ZIP");
-                    success = false;
-                }
+            if (!success && !urlString.startsWith(MIRROR_FALLBACK_BASE_URL)) {
+                logMessage("Downloading from mirrors failed, falling back to " + MIRROR_FALLBACK_BASE_URL);
+                // as fallback try to directly download from Jenkins server (only if mirrors fail)
+                urlString = appendPathOntoUrl(MIRROR_FALLBACK_BASE_URL, "/plugins", plugin.getName(), plugin.getVersion(), plugin.getName() + ".hpi");
+                return downloadToFile(urlString, plugin, fileLocation, 1);
             }
-
-            // both the download and zip validation passed
-            if(success) {
-                break;
-            }
+        } else if (urlString.startsWith("file://")){
+            success = copyLocalFile(urlString, plugin, pluginFile);
         }
 
-        if (!success) {
+        if (success) {
+            // Check integrity of plugin file
+            try (JarFile ignored = new JarFile(pluginFile)) {
+                verifyChecksum(plugin, pluginFile);
+                plugin.setFile(pluginFile);
+            } catch (IOException e) {
+                failedPlugins.add(plugin);
+                logMessage("Downloaded file is not a valid ZIP");
+                logOutput.printVerboseStacktrace(e);
+                return false;
+            } catch (PluginChecksumMismatchException e) {
+                failedPlugins.add(plugin);
+                logMessage(e.getMessage());
+                return false;
+            }
+        } else {
             failedPlugins.add(plugin);
         }
         return success;
     }
 
     /**
-     * Given a jar file and a key to retrieve from the jar's MANIFEST.MF file, confirms that the file is a jar returns
-     * the value matching the key
+     * Downloads a plugin from HTTP(s) location
      *
-     * @param file jar file to get manifest from
-     * @param key  key matching value to retrieve
-     * @return value matching the key in the jar file
+     * @param pluginUrl     location to download plugin to.
+     * @param plugin        to download
+     * @param pluginFile    location to store the plugin file.
+     *                      If file already exists, it will be overrided.
+     * @param maxRetries   Maximum number of times to retry the download before failing
+     * @return              boolean signifying if plugin was successfully downloaded
      */
-    public String getAttributeFromManifest(File file, String key) {
-        try (JarFile jarFile = new JarFile(file)) {
-            Manifest manifest = jarFile.getManifest();
-            Attributes attributes = manifest.getMainAttributes();
-            return attributes.getValue(key);
+    protected boolean downloadHttpToFile(String pluginUrl, Plugin plugin, File pluginFile, int maxRetries){
+        try {
+            getViaHttpWithResponseHandler(pluginUrl, new FileDownloadResponseHandler(pluginFile), plugin.getName(),
+                    e -> String.format("Unable to resolve plugin URL %s, or download plugin %s to file: %s", pluginUrl,
+                            plugin.getName(), e.getMessage()),
+                    maxRetries);
+
+            // Check if plugin is a proper ZIP file
+            try (JarFile ignored = new JarFile(pluginFile)) {
+                plugin.setFile(pluginFile);
+                logVerbose("Downloaded and validated plugin " + plugin.getName());
+            } catch (IOException e) {
+                throw new IOException("Downloaded file for " + plugin.getName() + " is not a valid ZIP", e);
+            }
         } catch (IOException e) {
-            System.out.println("Unable to open " + file);
-            if (key.equals("Plugin-Dependencies")) {
-                throw new DownloadPluginException("Unable to determine plugin dependencies", e);
+            logMessage(e.getMessage());
+            logOutput.printVerboseStacktrace(e);
+            return false;
+        }
+        return true;
+    }
+
+    @SuppressFBWarnings({"HTTP_PARAMETER_POLLUTION"})
+    private <T> T getViaHttpWithResponseHandler(String url, ResponseHandler<? extends T> responseHandler, String resourceName, Function<IOException, String> ioExceptionMessageSupplier, int maxRetries) throws IOException {
+        HttpClient httpClient = getHttpClient();
+        HttpClientContext context = HttpClientContext.create();
+        CredentialsProvider credentialsProvider = getCredentialsProvider();
+        if (credentialsProvider != null) {
+            context.setCredentialsProvider(credentialsProvider);
+        }
+        HttpGet httpGet = new HttpGet(url);
+        boolean success = false;
+        // TODO: retry logic should rather be implemented via DefaultHttpRequestRetruHandler, there is no need for an additional retry
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                T response = httpClient.execute(httpGet, responseHandler, context);
+                success = true;
+                return response;
+            } catch (IOException e) {
+                String message = ioExceptionMessageSupplier.apply(e);
+                if (i < maxRetries - 1) {
+                    logMessage(message);
+                } else {
+                    throw new IOException(message, e);
+                }
+            } finally {
+                // get final URI (after all redirects)
+                List<URI> locations = context.getRedirectLocations();
+                if (locations != null) {
+                    String message = String.format("%s %s from %s (attempt %d of %d)",
+                            success ? "Downloaded" : "Tried downloading", resourceName,
+                            locations.get(locations.size() - 1), i + 1, maxRetries);
+                    if (success) {
+                        logVerbose(message);
+                    } else {
+                        logMessage(message);
+                    }
+                }
             }
         }
+        throw new IllegalStateException("Reached maximum number of retries without triggering IOException");
+    }
+
+    /**
+     * Downloads a plugin from local folder location
+     *
+     * @param pluginUrl location to download plugin to.
+     * @param plugin   to download
+     * @param pluginFile    location to store the plugin file.
+     *                      If file already exists, it will be overrided.
+     * @return boolean signifying if plugin was successfully downloaded
+     */
+    @SuppressFBWarnings({"PATH_TRAVERSAL_IN"})
+    protected boolean copyLocalFile(String pluginUrl, Plugin plugin, File pluginFile){
+        boolean success = false;
+        try {
+            File originFile = new File(new URI(pluginUrl));
+            if(originFile.exists()){
+                Files.copy(originFile.toPath(), pluginFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                success = true;
+            } else {
+                String message = String.format("Unable to copy plugin URL %s, original file does not exists or is not accessible", originFile.getAbsolutePath());
+                logMessage(message);
+            }
+        } catch (URISyntaxException | InvalidPathException | IOException e) {
+            logMessage("ERROR " + e.getClass().toGenericString());
+
+            String message = String.format("Unable to resolve plugin URL %s, or copy plugin %s to file: %s",
+            pluginUrl, plugin.getName(), e.getMessage());
+            logMessage(message);
+            success = false;
+        }
+        return success;
+    }
+
+    private CredentialsProvider getCredentialsProvider() {
+        if (cfg.getCredentials().isEmpty()) {
+            return null;
+        }
+        CredentialsProvider credsProvider = new BasicCredentialsProvider();
+        for (Credentials credentials : cfg.getCredentials()) {
+            credsProvider.setCredentials(
+                    new AuthScope(credentials.getHost(), credentials.getPort()),
+                    new UsernamePasswordCredentials(credentials.getUsername(), credentials.getPassword()));
+        }
+        return credsProvider;
+    }
+
+    void verifyChecksum(Plugin plugin, File pluginFile) {
+        String expectedChecksum = plugin.getChecksum();
+        if (expectedChecksum == null) {
+            logVerbose("No checksum found for " + plugin.getName() + " (probably custom built plugin)");
+            return;
+        }
+
+        byte[] actualChecksumDigest = calculateChecksum(pluginFile);
+        byte[] expectedCheckSumDigest;
+
+        try {
+            expectedCheckSumDigest = Base64.getDecoder().decode(expectedChecksum);
+        } catch (IllegalArgumentException e) {
+            String actual = new String(Base64.getEncoder().encode(actualChecksumDigest), StandardCharsets.UTF_8);
+            throw new PluginChecksumMismatchException(plugin, expectedChecksum, actual);
+        }
+        if (!MessageDigest.isEqual(actualChecksumDigest, expectedCheckSumDigest)) {
+            String actual = new String(Base64.getEncoder().encode(actualChecksumDigest), StandardCharsets.UTF_8);
+            throw new PluginChecksumMismatchException(plugin, expectedChecksum, actual);
+        } else {
+            logVerbose("Checksum valid for: " + plugin.getName());
+        }
+    }
+
+    @SuppressFBWarnings(value = "WEAK_MESSAGE_DIGEST_SHA1", justification = "CloudBees update center only uses sha1, remove sha1 once this has been updated.")
+    private byte[] calculateChecksum(File pluginFile) {
+        try (FileInputStream fin = new FileInputStream(pluginFile)) {
+            HashFunction hashFunction = getHashFunction();
+            switch (hashFunction) {
+                case SHA1:
+                    return DigestUtils.sha1(fin);
+                case SHA512:
+                    return DigestUtils.sha512(fin);
+                case SHA256:
+                    return DigestUtils.sha256(fin);
+                default:
+                    throw new UnsupportedChecksumException(hashFunction.toString() + "is an unsupported hash function.");
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Gets Jenkins version using one of the available methods.
+     * @return Jenkins version or {@code null} if it cannot be determined
+     */
+    @CheckForNull
+    public VersionNumber getJenkinsVersion() {
+        if (jenkinsVersion != null) {
+            return jenkinsVersion;
+        }
+        if (jenkinsWarFile != null) {
+            return getJenkinsVersionFromWar();
+        }
+        logMessage("Unable to determine Jenkins version");
         return null;
     }
 
     /**
      * Gets the Jenkins version from the manifest in the Jenkins war specified in the Config class
      *
-     * @return Jenkins version
+     * @return Jenkins version or {@code null} if the version cannot be determined
      */
+    @CheckForNull
     public VersionNumber getJenkinsVersionFromWar() {
+        if (jenkinsWarFile == null) {
+            logMessage("Unable to get Jenkins version from the WAR file: WAR file path is not defined.");
+            return null;
+        }
         String version = getAttributeFromManifest(jenkinsWarFile, "Jenkins-Version");
         if (StringUtils.isEmpty(version)) {
-            System.out.println("Unable to get version from war file");
+            logMessage("Unable to get Jenkins version from the WAR file " + jenkinsWarFile.getPath());
             return null;
         }
         logVerbose("Jenkins version: " + version);
@@ -1076,10 +1542,21 @@ public class PluginManager {
     public String getPluginVersion(File file) {
         String version = getAttributeFromManifest(file, "Plugin-Version");
         if (StringUtils.isEmpty(version)) {
-            System.out.println("Unable to get plugin version from " + file);
+            logMessage("Unable to get plugin version from " + file);
             return "";
         }
         return version;
+    }
+
+    /**
+     * @param file plugin .hpi or .jpi of which to get the version
+     * @param key index key used to find the attribute in file
+     * @deprecated Use {@link ManifestTools#getAttributeFromManifest(File, String)}
+     * @return attribute for key as read from file
+     */
+    @Deprecated
+    public String getAttributeFromManifest(File file, String key) {
+        return ManifestTools.getAttributeFromManifest(file, key);
     }
 
     /**
@@ -1092,7 +1569,7 @@ public class PluginManager {
         FileFilter fileFilter = new WildcardFileFilter("*.jpi");
 
         // Only lists files in same directory, does not list files recursively
-        File[] files = refDir.listFiles(fileFilter);
+        File[] files = pluginDir.listFiles(fileFilter);
 
         if (files != null) {
             for (File file : files) {
@@ -1110,9 +1587,14 @@ public class PluginManager {
      *
      * @return list of names of plugins that are currently installed in the war
      */
-    @SuppressFBWarnings({"RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE", "PATH_TRAVERSAL_IN"})
+    @SuppressFBWarnings("PATH_TRAVERSAL_IN")
     public Map<String, Plugin> bundledPlugins() {
         Map<String, Plugin> bundledPlugins = new HashMap<>();
+
+        if (jenkinsWarFile == null) {
+            logMessage("WAR file is not defined, cannot retrieve the bundled plugins");
+            return bundledPlugins;
+        }
 
         if (jenkinsWarFile.exists()) {
             Path path = Paths.get(jenkinsWarFile.toString());
@@ -1153,9 +1635,23 @@ public class PluginManager {
                 throw new WarBundledPluginException("Unable to open war file to extract bundled plugin information", e);
             }
         } else {
-            System.out.println("War not found, installing all plugins: " + jenkinsWarFile.toString());
+            logMessage("War not found, installing all plugins: " + jenkinsWarFile.toString());
         }
         return bundledPlugins;
+    }
+
+
+    /**
+     * Gets the hash function used for the update center
+     *
+     * @return Jenkins update center hash function string
+     */
+    public HashFunction getHashFunction() {
+        return hashFunction;
+    }
+
+    public void setHashFunction(HashFunction hashFunction) {
+        this.hashFunction = hashFunction;
     }
 
     /**
@@ -1226,14 +1722,21 @@ public class PluginManager {
     }
 
     /**
-     * Outputs information to the console if verbose option was set to true
+     * Outputs information to the console (std err) if verbose option was set to true
      *
      * @param message informational string to output
      */
-    public void logVerbose(String message) {
-        if (verbose) {
-            System.out.println(message);
-        }
+    private void logVerbose(String message) {
+        logOutput.printVerboseMessage(message);
+    }
+
+    /**
+     * Output message to the console (std err).
+     *
+     * @param message informational string to output
+     */
+    private void logMessage(String message) {
+        logOutput.printMessage(message);
     }
 
     /**
@@ -1262,6 +1765,14 @@ public class PluginManager {
     }
 
     /**
+     * Sets the json object containing latest experimental plugin information
+     * @param experimentalPlugins JSONObject containing info for latest experimental plugins
+     */
+    public void setExperimentalPlugins(JSONObject experimentalPlugins) {
+        this.experimentalPlugins = experimentalPlugins;
+    }
+
+    /**
      * Sets the security warnings
      *
      * @param securityWarnings map of the plugin name to the list of security warnings for that plugin
@@ -1279,10 +1790,6 @@ public class PluginManager {
         this.pluginInfoJson = pluginInfoJson;
     }
 
-    public void setCm(CacheManager cm) {
-        this.cm = cm;
-    }
-
     /**
      * Gets the list of failed plugins
      *
@@ -1291,4 +1798,12 @@ public class PluginManager {
     public List<Plugin> getFailedPlugins() {
         return failedPlugins;
     }
+
+    @Override
+    public void close() throws IOException {
+        if (httpClient != null) {
+            httpClient.close();
+        }
+    }
+
 }

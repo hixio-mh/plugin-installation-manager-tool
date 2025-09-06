@@ -29,7 +29,9 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
+ snyk-upgrade-6427c50069152338b2e4348e3d8a16cb
             <version>3.18.0</version>
+ master
         </dependency>
         <dependency>
             <groupId>commons-validator</groupId>

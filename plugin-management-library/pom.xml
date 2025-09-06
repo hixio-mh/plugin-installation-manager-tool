@@ -70,11 +70,12 @@
         <dependency>
             <groupId>com.fasterxml.jackson.dataformat</groupId>
             <artifactId>jackson-dataformat-yaml</artifactId>
- snyk-upgrade-6c800b66dba4c5913425ccab13488fd4
-            <version>2.12.4</version>
+ snyk-upgrade-58dc21b1f82ef9f624a09cc41c281f52
+            <version>2.12.5</version>
  snyk-upgrade-9831fdb28e5ffad66846efe47943834e
             <version>2.19.2</version>
  master
+ 
         </dependency>
         <dependency>
             <groupId>com.github.spotbugs</groupId>

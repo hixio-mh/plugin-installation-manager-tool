@@ -1,5 +1,6 @@
 package io.jenkins.tools.pluginmanager.impl;
 
+import io.jenkins.tools.pluginmanager.config.LogOutput;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.io.Writer;
@@ -18,18 +19,20 @@ import static java.nio.file.Files.newInputStream;
 
 public class CacheManager {
 
-    private Path cache;
-    private boolean verbose;
-    private Clock clock;
+    private final Path cache;
+    private final LogOutput logOutput;
+    private final Clock clock;
+    private final boolean expires;
 
-    public CacheManager(Path cache, boolean verbose) {
-        this(cache, verbose, Clock.systemDefaultZone());
+    public CacheManager(Path cache, LogOutput logOutput) {
+        this(cache, logOutput, Clock.systemDefaultZone(), true);
     }
 
-    CacheManager(Path cache, boolean verbose, Clock clock) {
+    CacheManager(Path cache, LogOutput logOutput, Clock clock, boolean expires) {
         this.cache = cache;
-        this.verbose = verbose;
+        this.logOutput = logOutput;
         this.clock = clock;
+        this.expires = expires;
     }
 
     void createCache() {
@@ -40,9 +43,7 @@ public class CacheManager {
                     Files.createDirectory(parent);
                 }
                 Files.createDirectory(cache);
-                if (verbose) {
-                    System.out.println("Created cache at: " + cache);
-                }
+                logOutput.printVerboseMessage("Created cache at: " + cache);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -77,10 +78,11 @@ public class CacheManager {
             long betweenHours = between.toHours();
 
             if (betweenHours > 0L) {
-                if (verbose) {
-                    System.out.println("Cache entry expired");
+                logOutput.printVerboseMessage("Cache entry expired: " + cacheKey +
+                        (expires ? ". Will skip it" : ". Will accept it, because expiration is disabled"));
+                if (expires) {
+                    return null;
                 }
-                return null;
             }
 
             JSONTokener tokener = new JSONTokener(newInputStream(cachedPath));
@@ -88,18 +90,10 @@ public class CacheManager {
         } catch (NoSuchFileException e) {
             return null;
         } catch (RuntimeException e) {
-            if (verbose) {
-                System.err.println(
-                        "Cache ignored invalid file " + filename + ".");
-                e.printStackTrace();
-            }
+            logOutput.printVerboseMessage("Cache ignored invalid file " + filename + ".", e);
             return null;
         } catch (IOException e) {
-            if (verbose) {
-                System.err.println(
-                        "Cache ignored file " + filename + " because it cannot be read.");
-                e.printStackTrace();
-            }
+            logOutput.printVerboseMessage("Cache ignored file " + filename + " because it cannot be read.", e);
             return null;
         }
     }

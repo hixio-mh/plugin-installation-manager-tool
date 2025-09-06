@@ -47,7 +47,10 @@
         <dependency>
             <groupId>org.json</groupId>
             <artifactId>json</artifactId>
+ depend1abot/maven/org.mockito-mockito-core-5.19.0
+            <version>20230227</version>
             <version>20250517</version>
+ master
         </dependency>
         <dependency>
             <groupId>com.github.stefanbirkner</groupId>

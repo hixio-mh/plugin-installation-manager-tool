@@ -22,7 +22,9 @@
         <dependency>
             <groupId>commons-io</groupId>
             <artifactId>commons-io</artifactId>
+ snyk-upgrade-60383c36a21b4d7bc1efbdd705f8d9f5
             <version>2.20.0</version>
+ master
         </dependency>
         <dependency>
             <groupId>org.apache.commons</groupId>

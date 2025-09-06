@@ -8,19 +8,19 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.apache.commons.io.IOUtils;
 import org.json.JSONObject;
-import org.junit.Before;
-import org.junit.Ignore;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
 
 import static java.util.Collections.singletonList;
 import static org.assertj.core.api.Assertions.assertThat;
 
-public class PluginManagerUpdatesTest {
+class PluginManagerUpdatesTest {
 
     private PluginManager pm;
 
-    @Before
-    public void before() throws IOException {
+    @BeforeEach
+    void before() throws IOException {
         Config cfg = Config.builder()
                 .withJenkinsWar(Settings.DEFAULT_WAR)
                 .build();
@@ -28,26 +28,43 @@ public class PluginManagerUpdatesTest {
         pm = new PluginManager(cfg);
 
         JSONObject pluginInfoJson = loadPluginVersionsFromClassPath();
-        pm.setPluginInfoJson(pluginInfoJson);
+        pm.setLatestUcPlugins(pluginInfoJson.getJSONObject("plugins"));
+
+        JSONObject experimentalPlugins = loadExperimentalPluginVersionsFromClassPath();
+        pm.setExperimentalPlugins(experimentalPlugins.getJSONObject("plugins"));
     }
 
     @Test
-    public void simpleUpdate() {
+    void simpleUpdate() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(plugin("mailer", "1.31")));
 
         assertThat(latestVersionsOfPlugins)
-                .containsExactly(plugin("mailer", "1.32"));
+                .containsExactly(plugin("mailer", "1.32.1"));
+    }
+
+    @Test
+    void latestIsNotUpdated() {
+        List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(plugin("mailer", null)));
+
+        assertThat(latestVersionsOfPlugins)
+            .containsExactly(plugin("mailer", "latest"));
     }
 
     private JSONObject loadPluginVersionsFromClassPath() throws IOException {
-        try (InputStream stream = getClass().getResourceAsStream("available-updates/simple-plugin-versions.json")) {
+        try (InputStream stream = getClass().getResourceAsStream("available-updates/update-center.actual.json")) {
+            return new JSONObject(IOUtils.toString(stream, StandardCharsets.UTF_8));
+        }
+    }
+
+    private JSONObject loadExperimentalPluginVersionsFromClassPath() throws IOException {
+        try (InputStream stream = getClass().getResourceAsStream("available-updates/update-center.experimental.json")) {
             return new JSONObject(IOUtils.toString(stream, StandardCharsets.UTF_8));
         }
     }
 
     @Test
-    @Ignore("Need another source of data for incrementals, add later")
-    public void updateIncremental() {
+    @Disabled("Need another source of data for incrementals, add later")
+    void updateIncremental() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
                 pluginIncremental("mailer", "org.jenkins-ci.plugins", "1.31-rc315.eb08e134da74")
         ));
@@ -57,7 +74,7 @@ public class PluginManagerUpdatesTest {
     }
 
     @Test
-    public void incrementalIsnotUpgradedToGA() {
+    void incrementalIsnotUpgradedToGA() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
                 pluginIncremental("mailer", "org.jenkins-ci.plugins", "1.31-rc316.fb08e134da74")
         ));
@@ -67,7 +84,7 @@ public class PluginManagerUpdatesTest {
     }
 
     @Test
-    public void nonExistentPlugin() {
+    void nonExistentPlugin() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(plugin("non-existing-plugin", "1.31")));
 
         assertThat(latestVersionsOfPlugins)
@@ -75,7 +92,7 @@ public class PluginManagerUpdatesTest {
     }
 
     @Test
-    public void pluginHasCustomUrl() {
+    void pluginHasCustomUrl() {
         Plugin mailer = pluginUrl("mailer", "http://archives.jenkins-ci.org/plugins/mailer/1.31/mailer.hpi");
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
                 mailer)
@@ -86,35 +103,33 @@ public class PluginManagerUpdatesTest {
     }
 
     @Test
-    public void pluginIsFromExperimentalUpdateCenter() {
-
+    void pluginIsFromExperimentalUpdateCenter() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
-                plugin("display-url-api", "2.1.0-beta-1"))
+                plugin("help-editor", "0.1-beta-1"))
         );
 
         assertThat(latestVersionsOfPlugins)
-                .containsExactly(plugin("display-url-api", "2.2.0-beta-1"));
+                .containsExactly(plugin("help-editor", "0.1-beta-2"));
     }
 
     @Test
-    public void currentPluginIsExperimentalButGAVersionIsNewer() {
+    void currentPluginIsExperimentalButGAVersionIsNewer() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
                 plugin("mailer", "1.31-beta-1"))
         );
 
         assertThat(latestVersionsOfPlugins)
-                .containsExactly(plugin("mailer", "1.32"));
+                .containsExactly(plugin("mailer", "1.32.1"));
     }
 
     @Test
-    public void betaVersionNotOfferedToGAUsers() {
-        Plugin plugin = plugin("display-url-api", "2.1.0");
+    void newerExperimentalIsNotDowngradedToGA() {
         List<Plugin> latestVersionsOfPlugins = pm.getLatestVersionsOfPlugins(singletonList(
-                plugin)
+            plugin("mailer", "1.33-beta-1"))
         );
 
         assertThat(latestVersionsOfPlugins)
-                .containsExactly(plugin("display-url-api", "2.1.0"));
+            .containsExactly(plugin("mailer", "1.33-beta-1"));
     }
 
     private Plugin plugin(String name, String version) {

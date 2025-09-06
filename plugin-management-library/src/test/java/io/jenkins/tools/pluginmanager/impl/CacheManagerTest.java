@@ -1,16 +1,16 @@
 package io.jenkins.tools.pluginmanager.impl;
 
-import java.io.IOException;
+import io.jenkins.tools.pluginmanager.config.LogOutput;
+import java.io.File;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZoneId;
 import org.json.JSONObject;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
+import org.junit.jupiter.api.io.TempDir;
 
 import static com.github.stefanbirkner.systemlambda.SystemLambda.tapSystemErrNormalized;
-import static com.github.stefanbirkner.systemlambda.SystemLambda.tapSystemOutNormalized;
 import static java.nio.file.Files.setPosixFilePermissions;
 import static java.nio.file.Files.write;
 import static java.time.Clock.systemDefaultZone;
@@ -20,17 +20,18 @@ import static java.util.Collections.emptySet;
 import static java.util.Collections.singletonMap;
 import static org.apache.commons.lang3.SystemUtils.IS_OS_WINDOWS;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assume.assumeFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
-public class CacheManagerTest {
+class CacheManagerTest {
 
     private static final boolean VERBOSE = true;
 
-    @Rule
-    public final TemporaryFolder folder = new TemporaryFolder();
+    @TempDir(cleanup = CleanupMode.NEVER)
+    private File folder;
 
     @Test
-    public void cacheReturnsJsonThatWasPutIntoCacheForSpecifiedKey() {
+    void cacheReturnsJsonThatWasPutIntoCacheForSpecifiedKey() {
         CacheManager cacheManager = cacheManager();
         cacheManager.addToCache(
                 "the-cache-key",
@@ -46,7 +47,7 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void cacheReturnsLatestJsonThatWasPutIntoCacheForSpecifiedKey() {
+    void cacheReturnsLatestJsonThatWasPutIntoCacheForSpecifiedKey() {
         CacheManager cacheManager = cacheManager();
         cacheManager.addToCache(
                 "the-cache-key",
@@ -62,11 +63,11 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void cacheReturnsJsonStoredByAnotherCacheManagerInstance() throws Exception {
-        Path cacheFolder = folder.newFolder("reused_cache").toPath();
-        CacheManager writeInstance = new CacheManager(cacheFolder, !VERBOSE);
+    void cacheReturnsJsonStoredByAnotherCacheManagerInstance() {
+        Path cacheFolder = newFolder(folder, "reused_cache").toPath();
+        CacheManager writeInstance = new CacheManager(cacheFolder, new LogOutput(!VERBOSE));
         writeInstance.createCache();
-        CacheManager readInstance = new CacheManager(cacheFolder, !VERBOSE);
+        CacheManager readInstance = new CacheManager(cacheFolder, new LogOutput(!VERBOSE));
 
         writeInstance.addToCache(
                 "the-cache-key",
@@ -78,14 +79,14 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void cacheReturnsNullWhenNoJsonWasPutIntoCache() {
+    void cacheReturnsNullWhenNoJsonWasPutIntoCache() {
         JSONObject jsonObject = cacheManager().retrieveFromCache("key-without-json");
 
         assertThat(jsonObject).isNull();
     }
 
     @Test
-    public void cacheReturnsNullWhenJsonWasPutIntoCacheMoreThanAnHourAgo() {
+    void cacheReturnsNullWhenJsonWasPutIntoCacheMoreThanAnHourAgo() {
         CacheManager managerWithExpiredEntries = cacheManagerWithExpiredEntries();
 
         managerWithExpiredEntries.addToCache("the-cache-key", new JSONObject());
@@ -96,8 +97,8 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void messageThatCacheFolderIsCreatedIsWrittenToSystemOutWhenItDidNotExist() throws Exception {
-        String out = tapSystemOutNormalized(this::cacheManager);
+    void messageThatCacheFolderIsCreatedIsWrittenToSystemErrWhenItDidNotExist() throws Exception {
+        String out = tapSystemErrNormalized(this::cacheManager);
 
         assertThat(out)
                 .startsWith("Created cache at: ")
@@ -105,20 +106,20 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void infoAboutAnExpiredCacheEntryIsWrittenToSystemOut() throws Exception {
+    void infoAboutAnExpiredCacheEntryIsWrittenToSystemErr() throws Exception {
         CacheManager managerWithExpiredEntries = cacheManagerWithExpiredEntries();
 
         managerWithExpiredEntries.addToCache("the-cache-key", new JSONObject());
 
-        String out = tapSystemOutNormalized(
+        String out = tapSystemErrNormalized(
                 () -> managerWithExpiredEntries.retrieveFromCache("the-cache-key")
         );
 
-         assertThat(out).isEqualTo("Cache entry expired\n");
+         assertThat(out).isEqualTo("Cache entry expired: the-cache-key. Will skip it\n");
     }
 
     @Test
-    public void cacheReturnsNullWhenCachedFileIsNotJson() throws Exception {
+    void cacheReturnsNullWhenCachedFileIsNotJson() throws Exception {
         CacheManager manager = cacheManagerWithNonJsonFileForKey("the-cache-key");
 
         JSONObject jsonObject = manager.retrieveFromCache("the-cache-key");
@@ -127,7 +128,7 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void messageAboutInvalidCacheFileIsWrittenToSystemErr() throws Exception {
+    void messageAboutInvalidCacheFileIsWrittenToSystemErr() throws Exception {
         CacheManager manager = cacheManagerWithNonJsonFileForKey("the-cache-key");
 
         String out = tapSystemErrNormalized(
@@ -139,7 +140,7 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void cacheReturnsNullWhenCachedFileCannotBeRead() throws Exception {
+    void cacheReturnsNullWhenCachedFileCannotBeRead() throws Exception {
         skipOnWindows(); // we cannot modify the read permission on Windows
         CacheManager manager = cacheManagerWithNonReadableJsonFileForKey("the-cache-key");
 
@@ -149,7 +150,7 @@ public class CacheManagerTest {
     }
 
     @Test
-    public void cacheManagerWithNonReadableJsonFileForKey() throws Exception {
+    void cacheManagerWithNonReadableJsonFileForKey() throws Exception {
         skipOnWindows(); // we cannot modify the read permission on Windows
         CacheManager manager = cacheManagerWithNonReadableJsonFileForKey("the-cache-key");
 
@@ -179,24 +180,22 @@ public class CacheManagerTest {
 
     private CacheManager cacheManager(Clock clock) {
         Path cacheFolder = cacheFolder();
-        CacheManager manager = new CacheManager(cacheFolder, VERBOSE, clock);
+        CacheManager manager = new CacheManager(cacheFolder, new LogOutput(VERBOSE), clock, true);
         manager.createCache();
         return manager;
     }
 
-    private CacheManager cacheManagerWithNonJsonFileForKey(String key) throws IOException {
+    private CacheManager cacheManagerWithNonJsonFileForKey(String key) throws Exception {
         Path cacheFolder = cacheFolder();
-        CacheManager manager = new CacheManager(
-                cacheFolder, VERBOSE, systemDefaultZone());
+        CacheManager manager = new CacheManager(cacheFolder, new LogOutput(VERBOSE));
         manager.createCache();
         write(cacheFolder.resolve(key + ".json"), new byte[] { 1, 2, 3});
         return manager;
     }
 
-    private CacheManager cacheManagerWithNonReadableJsonFileForKey(String key) throws IOException {
+    private CacheManager cacheManagerWithNonReadableJsonFileForKey(String key) throws Exception {
         Path cacheFolder = cacheFolder();
-        CacheManager manager = new CacheManager(
-                cacheFolder, VERBOSE, systemDefaultZone());
+        CacheManager manager = new CacheManager(cacheFolder, new LogOutput(VERBOSE));
         manager.createCache();
         manager.addToCache(key, new JSONObject());
         setPosixFilePermissions(cacheFolder.resolve(key + ".json"), emptySet());
@@ -204,6 +203,13 @@ public class CacheManagerTest {
     }
 
     private Path cacheFolder() {
-        return folder.getRoot().toPath().resolve("cache");
+        return folder.toPath().resolve("cache");
+    }
+
+    private static File newFolder(File root, String... subDirs) {
+        String subFolder = String.join("/", subDirs);
+        File result = new File(root, subFolder);
+        assertTrue(result.mkdirs(), "Couldn't create folders " + result);
+        return result;
     }
 }
